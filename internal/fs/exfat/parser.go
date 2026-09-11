@@ -244,6 +244,49 @@ func (p *ExFatParser) ClusterHeapRange() (clusterSize uint64, firstCluster uint3
 	return p.info.ClusterSize, 2, p.info.Boot.ClusterCount
 }
 
+// SystemClusters 返回簇堆里承载文件系统公共信息（分配位图、根目录）的簇号。
+// 这些簇不存文件内容，却实实在在占着簇，恢复时不能当成可回收的空闲簇。
+//
+// up-case 表当前没有解析，无法指名；它会被归入「其他」状态。恢复只关心文件
+// 内容，所以不影响判断。
+func (p *ExFatParser) SystemClusters() []uint32 {
+	if p.info == nil {
+		return nil
+	}
+
+	var out []uint32
+
+	// 分配位图：DataLength 是字节数，可能跨多个簇。
+	if c := p.info.Bitmap.FirstCluster; c >= 2 {
+		count := (p.info.Bitmap.DataLength + p.info.ClusterSize - 1) / p.info.ClusterSize
+		if count == 0 {
+			count = 1
+		}
+		for i := uint64(0); i < count; i++ {
+			out = append(out, c+uint32(i))
+		}
+	}
+
+	// 根目录：一整条簇链，可能跨多个簇。
+	fat := p.info.FAT
+	seen := make(map[uint32]struct{})
+	for cid := p.info.Boot.RootDirectoryCluster; cid >= 2 && int(cid) < len(fat); {
+		if _, dup := seen[cid]; dup {
+			break
+		}
+		seen[cid] = struct{}{}
+		out = append(out, cid)
+
+		next := fatNextCluster(fat, cid)
+		if next == 0 {
+			break
+		}
+		cid = next
+	}
+
+	return out
+}
+
 func (p *ExFatParser) ReadCluster(cid uint32) ([]byte, error) {
 	boot := p.info.Boot
 	off, err := clusterOffset(&boot, cid, p.info.ClusterSize)

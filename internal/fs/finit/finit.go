@@ -18,6 +18,9 @@ type FileSystemParser interface {
 	GetClusterFSInfo(cid uint32) (alloc bool, fatNext uint32, err error)
 	ListAllFileEntries() ([]FileEntryItem, error)
 	ClusterHeapRange() (clusterSize uint64, firstCluster uint32, totalCluster uint32)
+	// SystemClusters 返回簇堆里承载文件系统公共信息（分配位图、根目录、
+	// up-case 表……）的簇号，它们不承载任何可恢复的文件内容。
+	SystemClusters() []uint32
 	ReadCluster(cid uint32) ([]byte, error)
 	DebugPrintMeta()
 }
