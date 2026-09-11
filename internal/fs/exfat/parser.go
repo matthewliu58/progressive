@@ -2,6 +2,7 @@ package exfat
 
 import (
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -19,6 +20,12 @@ const (
 	entryTypeFileName        = 0xC1
 	entryTypeFileNameDeleted = 0x41
 	entryTypeBitmap          = 0x81
+
+	// attrDirectory 是 File 条目 Attributes 字段的「这是目录」位（bit 4）
+	attrDirectory = 0x0010
+
+	// maxDirDepth 防止损坏卷上的目录互相指向导致无限递归
+	maxDirDepth = 64
 )
 
 type BootInfo struct {
@@ -47,6 +54,7 @@ type BitmapInfo struct {
 
 type FileInfo struct {
 	Name            string `json:"name"`
+	Path            string `json:"path"`
 	Attributes      uint16 `json:"attributes"`
 	FirstCluster    uint32 `json:"first_cluster"`
 	DataLength      uint64 `json:"data_length"`
@@ -64,6 +72,27 @@ type ExFATInfo struct {
 	Files       []FileInfo `json:"files"`
 	ClusterSize uint64     `json:"cluster_size"`
 	FAT         []uint32   `json:"-"`
+}
+
+// exFatMetaFile 在 FileInfo 上补一个由 Attributes 推导出的 is_dir
+type exFatMetaFile struct {
+	FileInfo
+	IsDir bool `json:"is_dir"`
+}
+
+// exFatMetaDump 是 DebugPrintMeta 打印的 JSON 结构
+type exFatMetaDump struct {
+	Boot   BootInfo        `json:"boot"`
+	Bitmap BitmapInfo      `json:"bitmap"`
+	Files  []exFatMetaFile `json:"files"`
+
+	ClusterSize     uint64 `json:"cluster_size"`
+	BitmapDataBytes int    `json:"bitmap_data_bytes"`
+	FATEntries      int    `json:"fat_entries"`
+	EntryCount      int    `json:"entry_count"`
+	LiveCount       int    `json:"live_count"`
+	DeletedCount    int    `json:"deleted_count"`
+	DirCount        int    `json:"dir_count"`
 }
 
 // ExFatParser 实现 FileSystemParser
@@ -128,17 +157,34 @@ func (p *ExFatParser) Load(f *os.File) error {
 		fatTable[cluster] = val & 0x0FFFFFFF
 	}
 
-	rootOff, err := clusterOffset(&boot, boot.RootDirectoryCluster, clusterSize)
+	// 根目录本身是一条 FAT 簇链，要整条读完——只读第一个簇的话，
+	// 后面簇里的条目（通常是较新的、还活着的那些）全都看不到。
+	// 根目录没有流扩展条目，dataLength 未知，传 0 表示一直读到链尾。
+	rootData, err := readDirData(f, &boot, fatTable, clusterSize, boot.RootDirectoryCluster, 0, false)
 	if err != nil {
-		return err
-	}
-	rootData := make([]byte, clusterSize)
-	_, err = f.ReadAt(rootData, int64(rootOff))
-	if err != nil {
-		return fmt.Errorf("read root dir cluster failed: %w", err)
+		return fmt.Errorf("read root dir failed: %w", err)
 	}
 
-	bitmapCluster, bitmapLen, files := parseRootDirectory(rootData)
+	bitmapCluster, bitmapLen, rootEntries := parseDirectoryEntries(rootData)
+
+	// 收下根目录下的条目，并对标记为目录的条目递归展开
+	files := make([]FileInfo, 0, len(rootEntries))
+	visitedDirs := map[uint32]bool{boot.RootDirectoryCluster: true}
+	for i := range rootEntries {
+		ent := rootEntries[i]
+		ent.Path = ent.Name
+		files = append(files, ent)
+
+		if !ent.isDir() || ent.FirstCluster < 2 || visitedDirs[ent.FirstCluster] {
+			continue
+		}
+		visitedDirs[ent.FirstCluster] = true
+		if err := walkDirectory(f, &boot, fatTable, clusterSize, ent, 1, visitedDirs, &files); err != nil {
+			// 单个子目录读失败不该让整个卷加载失败
+			p.warn("exfat: walk sub directory failed", ent.Path, err)
+		}
+	}
+
 	bitmapBytes, err := readAllocationBitmap(f, &boot, bitmapCluster, bitmapLen, clusterSize)
 	if err != nil {
 		return fmt.Errorf("read allocation bitmap failed: %w", err)
@@ -183,6 +229,7 @@ func (p *ExFatParser) ListAllFileEntries() ([]fsinit.FileEntryItem, error) {
 	for _, fi := range p.info.Files {
 		out = append(out, fsinit.FileEntryItem{
 			Name:         fi.Name,
+			Path:         fi.Path,
 			FirstCluster: fi.FirstCluster,
 			DataLength:   fi.DataLength,
 			ValidLength:  fi.ValidDataLength,
@@ -220,56 +267,39 @@ func (p *ExFatParser) DebugPrintMeta() {
 	}
 
 	info := p.info
-	b := info.Boot
 
-	logger.Debug("exfat boot",
-		slog.Any("pre", p.pre),
-		slog.Any("partition_offset", b.PartitionOffset),
-		slog.Any("volume_length", b.VolumeLength),
-		slog.Any("fat_offset_sector", b.FATOffset),
-		slog.Any("fat_length_sector", b.FATLength),
-		slog.Any("cluster_heap_offset_sector", b.ClusterHeapOffset),
-		slog.Any("cluster_count", b.ClusterCount),
-		slog.Any("root_dir_cluster", b.RootDirectoryCluster),
-		slog.Any("serial_number", b.VolumeSerialNumber),
-		slog.Any("fs_revision", b.FileSystemRevision),
-		slog.Any("volume_flags", b.VolumeFlags),
-		slog.Any("bytes_per_sector", b.BytesPerSector),
-		slog.Any("sectors_per_cluster", b.SectorsPerCluster),
-		slog.Any("number_of_fats", b.NumberOfFATs),
-		slog.Any("drive_select", b.DriveSelect),
-		slog.Any("percent_in_use", b.PercentInUse),
-		slog.Any("boot_signature", b.BootSignature),
-	)
-
-	logger.Debug("exfat layout",
-		slog.Any("pre", p.pre),
-		slog.Any("cluster_size", info.ClusterSize),
-		slog.Any("bitmap_first_cluster", info.Bitmap.FirstCluster),
-		slog.Any("bitmap_data_length", info.Bitmap.DataLength),
-		slog.Int("bitmap_data_bytes", len(info.BitmapData)),
-		slog.Int("fat_entries", len(info.FAT)),
-		slog.Int("file_count", len(info.Files)),
-	)
-
-	//logger.Debug("exfat fat table", slog.Any("pre", p.pre), slog.Any("fat", info.FAT))
-	//logger.Debug("exfat allocation bitmap", slog.Any("pre", p.pre), slog.Any("bitmap_data", info.BitmapData))
-
-	for i, f := range info.Files {
-		logger.Debug("exfat file",
-			slog.Any("pre", p.pre),
-			slog.Int("index", i),
-			slog.String("name", f.Name),
-			slog.Any("attributes", f.Attributes),
-			slog.Any("first_cluster", f.FirstCluster),
-			slog.Any("data_length", f.DataLength),
-			slog.Any("valid_data_length", f.ValidDataLength),
-			slog.Any("name_length", f.NameLength),
-			slog.Any("name_hash", f.NameHash),
-			slog.Any("no_fat_chain", f.NoFatChain),
-			slog.Any("is_deleted", f.IsDeleted),
-		)
+	dump := exFatMetaDump{
+		Boot:            info.Boot,
+		Bitmap:          info.Bitmap,
+		Files:           make([]exFatMetaFile, 0, len(info.Files)),
+		ClusterSize:     info.ClusterSize,
+		BitmapDataBytes: len(info.BitmapData),
+		FATEntries:      len(info.FAT),
+		EntryCount:      len(info.Files),
 	}
+	for i := range info.Files {
+		f := info.Files[i]
+		if f.IsDeleted {
+			dump.DeletedCount++
+		} else {
+			dump.LiveCount++
+		}
+		if f.isDir() {
+			dump.DirCount++
+		}
+		dump.Files = append(dump.Files, exFatMetaFile{FileInfo: f, IsDir: f.isDir()})
+	}
+
+	// 整块 marshal 成 JSON 再交给 logger，不要拆成几十个 slog 字段。
+	// 这里传 json.RawMessage 而不是 string：RawMessage 实现了 json.Marshaler，
+	// JSONHandler 会把它原样嵌进日志行；换成 string 会被再加一层引号转义，反而更难读。
+	b, err := json.Marshal(dump)
+	if err != nil {
+		logger.Error("exfat: marshal meta failed", slog.Any("pre", p.pre), slog.Any("err", err))
+		return
+	}
+
+	logger.Debug("exfat meta", slog.String("pre", p.pre), slog.Any("meta", json.RawMessage(b)))
 }
 
 func clusterOffset(boot *BootInfo, cluster uint32, clusterSize uint64) (uint64, error) {
@@ -281,18 +311,37 @@ func clusterOffset(boot *BootInfo, cluster uint32, clusterSize uint64) (uint64, 
 	return offset, nil
 }
 
-func parseRootDirectory(data []byte) (uint32, uint64, []FileInfo) {
+// parseDirectoryEntries 解析一段目录数据，返回分配位图信息（只有根目录有）和其中的所有条目。
+//
+// 关于 0x00：规范里它是「目录结束」标记，但卷大量增删之后目录中间是会出现 0x00
+// 空洞的（目录扩过簇、旧条目被清掉等）。所以这里只有确认「从这个位置到缓冲区末尾
+// 全是 0」才当作真的结束，否则当成一个空槽跳过继续扫——直接 break 的话，空洞后面
+// 的条目会整批丢掉。
+func parseDirectoryEntries(data []byte) (uint32, uint64, []FileInfo) {
 	var bitmapCluster uint32
 	var bitmapLength uint64
 	var outFiles []FileInfo
 	offset := 0
 	dlen := len(data)
 
+	// 最后一个非零字节的位置，用来 O(1) 判断「从某处到末尾是否全 0」
+	lastNonZero := 0
+	for i := dlen - 1; i >= 0; i-- {
+		if data[i] != 0 {
+			lastNonZero = i + 1
+			break
+		}
+	}
+
 	for offset+32 <= dlen {
 		ent := data[offset : offset+32]
 		typ := ent[0]
 		if typ == entryTypeEnd {
-			break
+			if offset >= lastNonZero {
+				break
+			}
+			offset += 32
+			continue
 		}
 		switch typ {
 		case entryTypeBitmap:
@@ -392,4 +441,117 @@ func readAllocationBitmap(f *os.File, boot *BootInfo, bitmapCluster uint32, bitm
 		return nil, fmt.Errorf("read allocation bitmap data: %w", err)
 	}
 	return buf[:bitmapLen], nil
+}
+
+func (f FileInfo) isDir() bool {
+	return f.Attributes&attrDirectory != 0
+}
+
+func (p *ExFatParser) warn(msg, path string, err error) {
+	if p.logger == nil {
+		return
+	}
+	p.logger.Warn(msg, slog.String("pre", p.pre), slog.String("path", path), slog.Any("err", err))
+}
+
+// readDirData 把一个目录的完整内容读出来——沿 FAT 簇链读，而不是只读一个簇。
+//
+// dataLength 传 0 表示长度未知（根目录没有对应的流扩展条目），此时一直读到
+// FAT 链结束。noFatChain 为 true 表示该目录数据是连续分配的，簇号为
+// firstCluster+i，不需要查 FAT。
+func readDirData(f *os.File, boot *BootInfo, fat []uint32, clusterSize uint64,
+	firstCluster uint32, dataLength uint64, noFatChain bool) ([]byte, error) {
+
+	if firstCluster < 2 {
+		return nil, nil
+	}
+
+	// 该目录最多有多少个簇：长度已知就按长度算，否则以 FAT 表长为上限
+	maxClusters := uint64(len(fat))
+	if dataLength > 0 {
+		if n := (dataLength + clusterSize - 1) / clusterSize; n > 0 && n < maxClusters {
+			maxClusters = n
+		}
+	}
+	if maxClusters == 0 {
+		maxClusters = 1
+	}
+
+	out := make([]byte, 0, clusterSize)
+	seen := make(map[uint32]struct{})
+	cluster := firstCluster
+
+	for i := uint64(0); i < maxClusters; i++ {
+		if noFatChain && i > 0 {
+			cluster = firstCluster + uint32(i)
+		}
+		if cluster < 2 || int(cluster) >= len(fat) {
+			break
+		}
+		if _, dup := seen[cluster]; dup {
+			break // FAT 链成环，停
+		}
+		seen[cluster] = struct{}{}
+
+		off, err := clusterOffset(boot, cluster, clusterSize)
+		if err != nil {
+			break
+		}
+		buf := make([]byte, clusterSize)
+		if _, err := f.ReadAt(buf, int64(off)); err != nil {
+			return out, fmt.Errorf("read dir cluster %d: %w", cluster, err)
+		}
+		out = append(out, buf...)
+
+		if noFatChain {
+			continue
+		}
+		cluster = fatNextCluster(fat, cluster)
+		if cluster == 0 {
+			break
+		}
+	}
+	return out, nil
+}
+
+// fatNextCluster 返回 FAT 中 cluster 的下一个簇号；0 表示链结束（EOC 或非法值）。
+func fatNextCluster(fat []uint32, cluster uint32) uint32 {
+	if int(cluster) >= len(fat) {
+		return 0
+	}
+	next := fat[cluster]
+	if next < 2 || int(next) >= len(fat) {
+		return 0
+	}
+	return next
+}
+
+// walkDirectory 递归展开一个子目录，把它内部的条目（含更深层的）追加到 out。
+// dir 是父目录里代表本目录的那条条目，它已经记在 out 里了，这里只处理它的内部。
+func walkDirectory(f *os.File, boot *BootInfo, fat []uint32, clusterSize uint64,
+	dir FileInfo, depth int, visited map[uint32]bool, out *[]FileInfo) error {
+
+	if depth > maxDirDepth {
+		return nil
+	}
+
+	data, err := readDirData(f, boot, fat, clusterSize, dir.FirstCluster, dir.DataLength, dir.NoFatChain)
+	if err != nil {
+		return err
+	}
+	_, _, entries := parseDirectoryEntries(data)
+
+	for i := range entries {
+		ent := entries[i]
+		ent.Path = dir.Path + "/" + ent.Name
+		*out = append(*out, ent)
+
+		if !ent.isDir() || ent.FirstCluster < 2 || visited[ent.FirstCluster] {
+			continue
+		}
+		visited[ent.FirstCluster] = true
+		// 单个子目录读失败不影响其它分支
+		_ = walkDirectory(f, boot, fat, clusterSize, ent, depth+1, visited, out)
+	}
+	return nil
 }

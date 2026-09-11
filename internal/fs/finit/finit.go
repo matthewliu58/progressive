@@ -4,6 +4,7 @@ import "os"
 
 type FileEntryItem struct {
 	Name         string
+	Path         string
 	FirstCluster uint32
 	DataLength   uint64
 	ValidLength  uint64
