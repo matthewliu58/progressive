@@ -234,6 +234,7 @@ func (p *ExFatParser) ListAllFileEntries() ([]fsinit.FileEntryItem, error) {
 			DataLength:   fi.DataLength,
 			ValidLength:  fi.ValidDataLength,
 			IsDeleted:    fi.IsDeleted,
+			IsDir:        fi.isDir(),
 			NoFatChain:   fi.NoFatChain,
 		})
 	}

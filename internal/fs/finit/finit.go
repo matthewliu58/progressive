@@ -9,6 +9,7 @@ type FileEntryItem struct {
 	DataLength   uint64
 	ValidLength  uint64
 	IsDeleted    bool
+	IsDir        bool
 	NoFatChain   bool
 }
 
