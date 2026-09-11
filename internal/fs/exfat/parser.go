@@ -1,12 +1,14 @@
 package exfat
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
 	fsinit "progrescarve/internal/fs/finit"
+	"strconv"
 	"unicode/utf16"
 )
 
@@ -71,7 +73,7 @@ type ExFATInfo struct {
 	BitmapData  []byte     `json:"-"`
 	Files       []FileInfo `json:"files"`
 	ClusterSize uint64     `json:"cluster_size"`
-	FAT         []uint32   `json:"-"`
+	FAT         []uint32   `json:"fat"`
 }
 
 // exFatMetaFile 在 FileInfo 上补一个由 Attributes 推导出的 is_dir
@@ -86,13 +88,41 @@ type exFatMetaDump struct {
 	Bitmap BitmapInfo      `json:"bitmap"`
 	Files  []exFatMetaFile `json:"files"`
 
-	ClusterSize     uint64 `json:"cluster_size"`
-	BitmapDataBytes int    `json:"bitmap_data_bytes"`
-	FATEntries      int    `json:"fat_entries"`
-	EntryCount      int    `json:"entry_count"`
-	LiveCount       int    `json:"live_count"`
-	DeletedCount    int    `json:"deleted_count"`
-	DirCount        int    `json:"dir_count"`
+	ClusterSize     uint64  `json:"cluster_size"`
+	BitmapDataBytes int     `json:"bitmap_data_bytes"`
+	FATEntries      int     `json:"fat_entries"`
+	FAT             fatDump `json:"fat"`
+	EntryCount      int     `json:"entry_count"`
+	LiveCount       int     `json:"live_count"`
+	DeletedCount    int     `json:"deleted_count"`
+	DirCount        int     `json:"dir_count"`
+}
+
+// fatDumpEntries 是 DebugPrintMeta 里输出 FAT 的项数。整表 390 万项（1TB 卷），
+// 全铺出来十几 MB，一行日志直接废掉；前 1000 项够看清簇堆开头的排布。
+const fatDumpEntries = 1000
+
+// fatDump 把 FAT 前若干项写成「簇号: 值」的 JSON 对象。
+//
+// 不用 map[uint32]uint32：encoding/json 会先把整数键转成字符串、再按字典序排，
+// 于是 "10" 插在 "100" 前面，簇号顺序就废了；这里自己按簇号升序逐个写出。
+type fatDump []uint32
+
+func (f fatDump) MarshalJSON() ([]byte, error) {
+	var b bytes.Buffer
+	b.Grow(8 + len(f)*12)
+	b.WriteByte('{')
+	for i, v := range f {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('"')
+		b.WriteString(strconv.FormatUint(uint64(i), 10))
+		b.WriteString(`":`)
+		b.WriteString(strconv.FormatUint(uint64(v), 10))
+	}
+	b.WriteByte('}')
+	return b.Bytes(), nil
 }
 
 // ExFatParser 实现 FileSystemParser
@@ -333,6 +363,14 @@ func (p *ExFatParser) DebugPrintMeta() {
 		}
 		dump.Files = append(dump.Files, exFatMetaFile{FileInfo: f, IsDir: f.isDir()})
 	}
+
+	// FAT 只带前 fatDumpEntries 项：它是按簇号铺的切片，3.9M 项全塞进日志会撑爆一行。
+	// 条目数本身由 FATEntries 给出，剩下的簇要查就直接读 FAT。
+	n := len(info.FAT)
+	if n > fatDumpEntries {
+		n = fatDumpEntries
+	}
+	dump.FAT = fatDump(info.FAT[:n])
 
 	// 整块 marshal 成 JSON 再交给 logger，不要拆成几十个 slog 字段。
 	// 这里传 json.RawMessage 而不是 string：RawMessage 实现了 json.Marshaler，

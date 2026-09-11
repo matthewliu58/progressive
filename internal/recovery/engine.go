@@ -123,7 +123,7 @@ func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger, pre 
 		limit := chainLimit(e.DataLength)
 		seen := make(map[uint32]struct{}, limit)
 
-		for i := uint64(0); i < limit; i++ {
+		for i := range limit {
 			if cid < firstCid || cid >= lastCid {
 				return // 簇号越界，链坏在这里
 			}
