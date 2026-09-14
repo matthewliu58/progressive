@@ -654,6 +654,16 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 		slog.Uint64("bytes", sum.Bytes),
 		slog.String("out_root", outRoot))
 
+	// 恢复先跑完，再做空闲簇扫描：扫描要把整张卡的空闲簇读一遍（1TB 得一阵子），
+	// 放在后面不挡文件落地。
+	stats := Scan(parser, state, pre, logger)
+	logger.Info("scan free clusters done",
+		append([]any{
+			slog.String("pre", pre),
+			slog.Int("scanned", stats.Scanned),
+			slog.Int("read_failed", stats.ReadFailed),
+		}, hitAttrs(stats.Hits)...)...)
+
 	logger.Info("recovery end", slog.String("pre", pre), slog.String("path", path))
 	return nil
 }
