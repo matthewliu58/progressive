@@ -13,7 +13,10 @@ func IsJPEGHeader(data []byte) bool {
 }
 
 // Feature 是一个簇里 JPEG 熵编码流的统计特征。
+// BlockSize：原始输入数据字节长度，由Scan填充，避免外部传入total传错。
+// 注意：若0xFF落在本块最后一字节，紧随的0x00在下一簇，则StuffedCount会被低估（磁盘雕刻固有边界问题）。
 type Feature struct {
+	BlockSize    int     // 输入块字节大小，Scan自动填充
 	FFCount      int     // 0xFF 总个数
 	StuffedCount int     // FF 00：熵编码里 0xFF 后必须补 0x00
 	RestartCount int     // FF D0~D7：重启标记，只出现在熵编码流里
@@ -23,6 +26,11 @@ type Feature struct {
 // Scan 统计 data 的 JPEG 特征，一遍扫完。
 func Scan(data []byte) Feature {
 	var f Feature
+	f.BlockSize = len(data)
+	if len(data) == 0 {
+		return f
+	}
+
 	var freq [256]int
 
 	for i := 0; i < len(data); i++ {
@@ -32,7 +40,7 @@ func Scan(data []byte) Feature {
 		}
 		f.FFCount++
 		if i+1 >= len(data) {
-			continue // FF 在簇末尾，下一个字节在下一簇
+			continue // FF 在簇末尾，下一个字节在下一簇，无法判定是否 FF‑00 stuffing
 		}
 		switch data[i+1] {
 		case 0x00:
@@ -73,7 +81,10 @@ func shannonEntropy(freq []int, total int) float64 {
 // 里期望 ~32 个，比真 JPEG（多数编码器不开重启间隔）还多，判了就是误报。
 //
 // 这里只做候选筛选；「不像」读作「目前不像」，不是证明不是。
-func IsLikelyJPEG(f Feature, total int) bool {
+//
+// 调用方式：feat := Scan(block); ok := IsLikelyJPEG(feat)
+func IsLikelyJPEG(f Feature) bool {
+	total := f.BlockSize
 	if total == 0 {
 		return false
 	}

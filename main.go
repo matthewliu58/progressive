@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -60,6 +61,9 @@ func isMountPoint(p string) bool {
 }
 
 func main() {
+
+	fmt.Println("=== MAIN START1 ===")
+
 	pre := "progrescarve"
 
 	// 终端用文本格式给人读，文件留 JSON + 源码位置方便事后翻。
@@ -81,6 +85,8 @@ func main() {
 			AddSource: true,
 		}))
 	}
+
+	fmt.Println("=== MAIN START2 ===")
 
 	logger := slog.New(&SourceHandler{handler: slog.NewMultiHandler(handlers...)})
 	slog.SetDefault(logger)
@@ -111,17 +117,20 @@ func main() {
 		os.Exit(1)
 	}
 
-	recovery.Engine(path, outRoot, pre, logger)
+	// Engine 的返回值不能丢：识别不出文件系统、设备打不开这些失败只在日志里有，
+	// 返回值一丢进程照样往下走，最后退出码还是 0，脚本和 CI 都看不出失败过。
+	if err := recovery.Engine(path, outRoot, pre, logger); err != nil {
+		logger.Error("recovery engine failed", slog.String("pre", pre), slog.Any("err", err))
+		os.Exit(1)
+	}
 
 	router := gin.Default()
 	router.GET("/health", func(c *gin.Context) {
 		c.JSON(http.StatusOK, "success")
 	})
-
-	var err error
 	logger.Info("api port started", slog.String("pre", pre), slog.String("port", ":8080"))
-	if err = router.Run(":8080"); err != nil {
+	if err := router.Run(":8080"); err != nil {
 		logger.Error("service start failed", slog.String("pre", pre), slog.Any("err", err))
-		return
 	}
+
 }

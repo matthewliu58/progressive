@@ -37,7 +37,7 @@ type detector struct {
 // all 是注册表。新增格式：加 Kind 枚举值、建子包、往这里加一行。
 var all = []detector{{
 	header:      jpeg.IsJPEGHeader,
-	payload:     func(data []byte) bool { return jpeg.IsLikelyJPEG(jpeg.Scan(data), len(data)) },
+	payload:     func(data []byte) bool { return jpeg.IsLikelyJPEG(jpeg.Scan(data)) },
 	kindHeader:  KindJPEGHeader,
 	kindPayload: KindJPEGPayload,
 }}
