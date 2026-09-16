@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"log/slog"
 	"strings"
 
 	"progrescarve/internal/feature"
@@ -19,6 +20,41 @@ import (
 //     （连续分配，planChain 已经按自增走过了）。打分只在这些事实都断掉之后才上场。
 //   - 猜不出来就返回 nil。宁可少给，别给错的 —— 错的字节混在前半段完好的数据里，
 //     比少给几簇难发现得多。
+
+// indexEdgeScore 只用索引里的特征给「a → b」这一对打分，不回读磁盘。
+//
+// 两边都得在扫描时命中过（也就是都是 JPEG 候选）才打得出分；有一边查不到就不打 ——
+// 不值得为了记一条日志把整簇再读一遍，扫描阶段已经读过一次了。
+func indexEdgeScore(stats *ScanStats, a, b uint32) (float64, bool) {
+	ha, okA := stats.HitAt(a)
+	hb, okB := stats.HitAt(b)
+	if !okA || !okB || ha.JPEG == nil || hb.JPEG == nil {
+		return 0, false
+	}
+	return jpeg.ScoreNext(*ha.JPEG, *hb.JPEG), true
+}
+
+// logEdgeScore 把「prevCID → nextCID」这一对的关系分打出来。
+//
+// 凡是判断两簇关系的地方都要走这里。拼接的依据全在这个分数上：不打出来，事后既
+// 解释不了为什么接了这一簇，也没法回来调阈值。
+//
+// why 说明这一对是在哪一步判的（连续自增、窗口搜索、尾巴……），extra 带上那一步
+// 自己的上下文。级别是 Debug：每一步都打，走 Info 会刷屏。
+func logEdgeScore(logger *slog.Logger, path string, prevCID, nextCID uint32,
+	score float64, why string, extra ...any) {
+	if logger == nil {
+		return
+	}
+	attrs := []any{
+		slog.String("entry", path),
+		slog.Uint64("prev", uint64(prevCID)),
+		slog.Uint64("next", uint64(nextCID)),
+		slog.String("why", why),
+		slog.Float64("score", score),
+	}
+	logger.Debug("cluster edge score", append(attrs, extra...)...)
+}
 
 // expectsJPEG 按扩展名判断这个文件「按理说」该是 JPEG。
 //
@@ -87,16 +123,19 @@ const (
 // 上下文（最后一簇是谁、还差多少字节）只有那里最清楚，回到调用方再拼一遍既别扭
 // 又容易错。last 是链上最后一个有指针可达的簇，want 是还差的字节数。
 func carveChain(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
-	claims map[uint32]string, last uint32, want uint64, clusterSize uint64) []uint32 {
+	claims map[uint32]string, last uint32, want uint64, clusterSize uint64,
+	logger *slog.Logger, path string) []uint32 {
 	if stats == nil || clusterSize == 0 || want == 0 {
 		return nil
 	}
-	return carveFollow(parser, stats, state, claims, last, want, clusterSize)
+	return carveFollow(parser, stats, state, claims, last, want, clusterSize, logger, path)
 }
 
 // carveFollow 从 last 往后一簇一簇地把后续碎片接出来。want 是还差多少字节。
+// logger / path 只用来把每一步的关系分打出来（见 logEdgeScore）。
 func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
-	claims map[uint32]string, last uint32, want uint64, clusterSize uint64) []uint32 {
+	claims map[uint32]string, last uint32, want uint64, clusterSize uint64,
+	logger *slog.Logger, path string) []uint32 {
 
 	// 前一簇的特征是打分基准：后面每一簇都要跟它比。
 	prev := featureOf(parser, stats, last)
@@ -117,11 +156,18 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 		if want <= clusterSize {
 			if tail := last + 1; tailOK(stats, state, claims, used, tail) {
 				guessed = append(guessed, tail)
+				// 最后一簇通常统计上不像 JPEG，索引里没有它，多半打不出关系分；
+				// 那就只记下接了谁，事后能对着簇号回查。
+				if score, ok := indexEdgeScore(stats, last, tail); ok {
+					logEdgeScore(logger, path, last, tail, score, "tail")
+				} else {
+					logEdgeScore(logger, path, last, tail, 0, "tail_no_feature")
+				}
 			}
 			break
 		}
 
-		next, ok := pickNext(stats, state, claims, used, prev, last)
+		next, ok := pickNext(stats, state, claims, used, prev, last, logger, path)
 		if !ok {
 			break // 窗口里没有能接的，到此为止
 		}
@@ -152,19 +198,27 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 // 先试连续的 last+1：exFAT 分配器默认连续分配，这一种的命中率远高于任何打分，
 // 而且它是「分配器的行为」，不是统计巧合。连续的那簇不能用，才退到窗口里按分挑。
 func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
-	used map[uint32]bool, prev *jpeg.Feature, last uint32) (uint32, bool) {
+	used map[uint32]bool, prev *jpeg.Feature, last uint32,
+	logger *slog.Logger, path string) (uint32, bool) {
 
+	// 连续的那簇直接收，不看分（分配器的默认行为比打分可靠），但分照样记一笔：
+	// 事后要能看出「这一段虽然按连续收了，其实关系分很低」，那才是真断了的地方。
 	if cont := last + 1; usable(stats, state, claims, used, cont) {
+		if score, ok := indexEdgeScore(stats, last, cont); ok {
+			logEdgeScore(logger, path, last, cont, score, "contiguous")
+		}
 		return cont, true
 	}
 
 	var best uint32
 	bestScore := 0.0
+	considered := 0
 	for cid := last + 2; cid <= last+carveWindow; cid++ {
 		if !usable(stats, state, claims, used, cid) {
 			continue
 		}
 		h, _ := stats.HitAt(cid)
+		considered++
 		if score := jpeg.ScoreNext(*prev, *h.JPEG); score > bestScore {
 			best, bestScore = cid, score
 		}
@@ -176,6 +230,8 @@ func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 	if best == 0 || bestScore < carveMinScore {
 		return 0, false
 	}
+	logEdgeScore(logger, path, last, best, bestScore, "window",
+		slog.Int("candidates", considered))
 	return best, true
 }
 

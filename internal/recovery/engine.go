@@ -335,11 +335,20 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 			need -= clusterSize
 		}
 
-		// TODO(连续分配也要校验)：NoFatChain 只是说「当年是连续分配的」，不代表这些簇
-		// 现在还是当年的内容 —— 删除之后它们可能被别的数据写过。现在一路自增照单全收，
-		// 中间某一簇被污染的概率是有的。要修得对着扫描索引逐簇核（见 carve.go 的
-		// checkFirstCluster 那一套），发现不像就停。
+		// NoFatChain 说的是「当年连续分配」，不等于这些簇的内容现在还挨着 ——
+		// 删除之后它们可能被别的数据写过。这里仍然照自增收下（不收就整个文件没了），
+		// 但每一对的关系分都打出来（见 carve.go 的 logEdgeScore）：分数明显不对劲的
+		// 那一段，就是实际断掉的地方。
+		//
+		// TODO(连续分配的拦断点)：分打出来了，等拿真数据标定出「多低算断」再决定拦不拦。
+		// 现在拦了会误杀 —— 文件头的统计特征跟后面的熵编码簇本来就不像，分数天然偏低。
+		// todo 如果断了是不是要 carve 然后再顺序读 断了再carve 然后再回来 +1顺序读
 		if entry.NoFatChain {
+			if stats != nil {
+				if score, ok := indexEdgeScore(stats, cid, cid+1); ok {
+					logEdgeScore(logger, entry.Path, cid, cid+1, score, "no_fat_chain")
+				}
+			}
 			cid++ // 连续分配，簇号自增，不用查 FAT
 			continue
 		}
@@ -383,7 +392,8 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 		// 就地续接：指针到这儿就断了，后半段只能按内容特征去找。last / want 这两个
 		// 数只有这一步最清楚，在这里把 list 组装好交给 writePlan，不在外面重算一遍。
 		if len(plan.chain) > 0 {
-			plan.guessed = carveChain(parser, stats, state, claims, plan.chain[len(plan.chain)-1], need, clusterSize)
+			plan.guessed = carveChain(parser, stats, state, claims,
+				plan.chain[len(plan.chain)-1], need, clusterSize, logger, entry.Path)
 			if claims != nil {
 				// 猜出来的簇也要认领，否则两个残缺文件会把同一簇各自写进自己的输出。
 				// TODO(回溯)：猜错时要能把认领撤回来，现在是一次认到底，没有回头路。
