@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"progrescarve/internal/feature"
 	"progrescarve/internal/fs"
 	fsinit "progrescarve/internal/fs/finit"
 	"strings"
@@ -81,13 +82,37 @@ func (e *ShortChainError) Error() string {
 		e.LastCluster, why, e.Got, e.Shortfall, e.Want)
 }
 
+// FirstClusterError 表示目录项指的第一簇内容对不上：那一簇被扫过，但开头不是 JPEG 的
+// SOI。成因是文件删除后这一簇被别的数据覆盖了 —— 目录项里的簇号没变，内容早换了。
+//
+// 这种文件写出来只是多一个「看着像那么回事」的假阳性：没有 SOI 就没有任何解码器能
+// 打开它。宁可判失败、在日志里说清原因，也别让它混进输出目录。
+type FirstClusterError struct {
+	Cluster   uint32       // 目录项指向的第一簇
+	Kind      feature.Kind // 扫描判定它像什么；KindNone = 什么都不像
+	SOIOffset int          // 簇内 SOI 的偏移：-1 = 压根没有 SOI；>0 = 有，但不在簇首
+	Path      string       // 条目路径
+}
+
+func (e *FirstClusterError) Error() string {
+	// 两种「不是头」要说清：簇里压根没有 SOI（整个被盖成别的东西），
+	// 和有 SOI 但不在开头（这一簇其实是别人文件的中间段，尾部接了个新文件的头）。
+	where := "no SOI in cluster"
+	if e.SOIOffset >= 0 {
+		where = fmt.Sprintf("SOI at offset %d, not 0", e.SOIOffset)
+	}
+	return fmt.Sprintf("first cluster %d of %q is not a JPEG head (%s, scanned as %s): overwritten after deletion",
+		e.Cluster, e.Path, where, e.Kind)
+}
+
 // RestoreResult 说明一次恢复实际捞回了多少。
 //
 // Truncated 必须单独记：断点之后的簇已经没有任何指针可达，而残缺文件的大小是完全
 // 合法的 —— 只看 dst 大小分不出「完整」和「只剩前半段」。
 type RestoreResult struct {
 	Bytes     uint64            // 实际写入 dst 的字节数
-	Clusters  int               // 恢复出的簇数
+	Clusters  int               // 恢复出的簇数（含猜出来的）
+	Carved    int               // 其中靠内容特征猜出来的簇数：>0 说明这份的后半段是蒙的
 	Truncated bool              // true：只恢复了前半段
 	Stop      *OverwrittenError // 断在哪、被谁占了；非「被占」截断时为 nil
 	Short     *ShortChainError  // 链在长度前就断了时的详情；否则 nil
@@ -95,7 +120,8 @@ type RestoreResult struct {
 
 // BuildClusterState 遍历所有未删除的条目，沿簇链走一遍，得到「簇号 → 占用状态」表：
 // 恢复已删除文件时用它判断原来的簇是否已被覆盖。只读元数据，不读文件内容。
-func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger, pre string) (map[uint32]ClusterState, ClusterOwner, error) {
+func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger,
+	pre string) (map[uint32]ClusterState, ClusterOwner, error) {
 	clusterSize, firstCid, totalCid := parser.ClusterHeapRange()
 	if totalCid == 0 {
 		return nil, nil, errors.New("cluster heap is empty")
@@ -216,6 +242,10 @@ type chainPlan struct {
 	chain []uint32          // 断点之前、可恢复的簇，按链上顺序
 	stop  *OverwrittenError // 非 nil：撞上活文件，之后的簇没有任何指针可达
 	short *ShortChainError  // 非 nil：FAT 在 DataLength 之前就没了下一簇
+
+	// guessed 是断链之后靠内容特征猜回来的簇（见 carve.go）：顺序不是元数据说的，
+	// 是猜的。写盘时单独记一笔，别和 chain 里那些有指针可达的簇混为一谈。
+	guessed []uint32
 }
 
 // planChain 沿链走一遍并校验。两种「走不到头」都只截断、不报错 —— 断点之前的数据是完好的，
@@ -224,7 +254,13 @@ type chainPlan struct {
 //   - FAT 说没有下一簇、但长度还没喂饱：short 记下断在哪一簇、FAT 项是什么值。
 //
 // 只有无法解释的元数据错误（簇号越界、FAT 成环、FAT 读失败）才返回 error。
-func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state map[uint32]ClusterState, owners ClusterOwner) (chainPlan, error) {
+//
+// stats / claims 是给断链续接用的（见 carve.go）：走到「FAT 没有下一簇、长度还没喂饱」
+// 那一步时，就地按内容特征把后续碎片猜回来，塞进 plan.guessed。传 nil 就退回
+// 「只写前半段」的老路子。claims 是全局认领表，chain 和 guessed 里的簇都要登记。
+// logger 只用来记「第一簇被污染」这条告警，可为 nil。
+func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state map[uint32]ClusterState,
+	owners ClusterOwner, stats *ScanStats, claims map[uint32]string, logger *slog.Logger) (chainPlan, error) {
 	clusterSize, firstCid, totalCid := parser.ClusterHeapRange()
 	if totalCid == 0 {
 		return chainPlan{}, errors.New("cluster heap is empty")
@@ -268,6 +304,16 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 			return plan, nil
 		}
 
+		// 第一簇必须自己证明是这个文件的一部分：目录项给的是簇号，而那一簇的内容
+		// 在删除之后可能早被别的数据覆盖了。扫过却不是 JPEG 头 = 已经不是图像开头，
+		// 接着往下写只会得到一个打不开的假阳性。
+		if len(plan.chain) == 0 {
+			if err := checkFirstCluster(stats, state, entry, cid); err != nil {
+				logFirstClusterBad(logger, entry, cid, err)
+				return chainPlan{}, err
+			}
+		}
+
 		plan.chain = append(plan.chain, cid)
 
 		if need > 0 {
@@ -278,6 +324,7 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 			need -= clusterSize
 		}
 
+		// todo 这里面也有问题因为也不确实顺序读出的是不是被污染的 有概率
 		if entry.NoFatChain {
 			cid++ // 连续分配，簇号自增，不用查 FAT
 			continue
@@ -296,6 +343,14 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 		cid = next
 	}
 
+	// chain 里的簇是元数据确认可达的，先全部认领掉：别的文件续接时不能把它们抢走。
+	// todo 这里面有一些确认的也可能是假的 后续需要回溯
+	if claims != nil {
+		for _, cid := range plan.chain {
+			claims[cid] = entry.Path
+		}
+	}
+
 	// FAT 说没有下一簇了，但 DataLength 还没喂饱。前段已经拿在手里、是完好的，
 	// 后半段没有任何指针可达 —— 截断交出前段，但必须让调用方知道这份是残的。
 	if need > 0 {
@@ -307,6 +362,18 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 			LastFatNext: endFatNext,
 			Path:        entry.Path,
 		}
+
+		// 就地续接：指针到这儿就断了，后半段只能按内容特征去找。last / want 这两个
+		// 数只有这一步最清楚，在这里把 list 组装好交给 writePlan，不在外面重算一遍。
+		if len(plan.chain) > 0 {
+			plan.guessed = carveChain(parser, stats, state, claims, plan.chain[len(plan.chain)-1], need, clusterSize)
+			if claims != nil {
+				// todo 暂时逻辑 这里面有一些确认的也可能是假的 后续需要回溯
+				for _, cid := range plan.guessed {
+					claims[cid] = entry.Path
+				}
+			}
+		}
 	}
 	return plan, nil
 }
@@ -317,27 +384,57 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 // 不全盘放弃，而是写出断点之前的部分并置 Truncated —— 断点成因看 Stop（撞上活文件）或
 // Short（FAT 提前结束）。链本身无法解释（越界、成环、FAT 读失败）才是硬错误，一个字节都不写。
 //
+// stats 是空闲簇扫描的结果索引：链断在 DataLength 之前时（Short != nil），用它去猜后续
+// 碎片，猜到的簇记在 res.Carved 里。传 nil 就退回「只写前半段」的老路子。
+// claims 是全局认领表（簇号 → 条目路径）：这份文件用掉的簇都要登记，别的文件续接时
+// 才不会把同一簇抢走，各自写出一份错的。传 nil 表示不做认领。
+//
 // dst 的父目录会按需建出来。直接传 /dev/xxx 这类设备节点也可以，但会从设备起始位置
 // 覆盖原有内容 —— 务必确认那不是源盘。
-func RestoreFile(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state map[uint32]ClusterState, owners ClusterOwner, dst string) (RestoreResult, error) {
-	plan, err := planChain(parser, entry, state, owners)
+func RestoreFile(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state map[uint32]ClusterState,
+	owners ClusterOwner, stats *ScanStats, claims map[uint32]string, dst string, logger *slog.Logger) (RestoreResult, error) {
+	// 续接发生在 planChain 内部：链走到断点那一刻就地找后续碎片，出这个函数时
+	// plan 已经是「确定部分 ++ 猜出来部分」的完整列表，这里只管写。
+	plan, err := planChain(parser, entry, state, owners, stats, claims, logger)
 	if err != nil {
 		return RestoreResult{}, err
 	}
-	return writePlan(parser, entry, plan, dst)
+	return writePlan(parser, entry, plan, dst, logger)
 }
 
 // writePlan 把 plan 里的簇读出来按顺序写进 dst，返回实际恢复量。
 // chain 为空（链头就被占住）时一个字节都不写、也不建 dst：空文件会让人以为恢复成功了。
-func writePlan(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, plan chainPlan, dst string) (RestoreResult, error) {
+//
+// 写出顺序是 chain ++ guessed：先是有指针可达的簇，再是猜出来的簇。DataLength 的
+// 截断一视同仁 —— 猜出来的最后一簇也按剩余长度切，多出来的字节是下一个文件的。
+//
+// logger 可为 nil（不打印）。簇号清单打 Debug：每个文件一条、簇数可能上千，
+// 走 Info 会把终端刷掉；文件日志是 Debug 级，全程留着事后翻。
+func writePlan(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, plan chainPlan, dst string, logger *slog.Logger) (RestoreResult, error) {
 	res := RestoreResult{
-		Clusters:  len(plan.chain),
+		Clusters:  len(plan.chain) + len(plan.guessed),
+		Carved:    len(plan.guessed),
 		Truncated: plan.stop != nil || plan.short != nil,
 		Stop:      plan.stop,
 		Short:     plan.short,
 	}
 	if len(plan.chain) == 0 {
 		return res, nil
+	}
+	// all 是最终写盘的顺序：先是元数据确认的 chain，再是猜出来的 guessed。
+	// 打出来是为了事后能对着簇号回查「这份文件到底由哪些簇拼成」—— 猜的那几簇
+	// 尤其要能单独认出来，人工核对时全靠这一条。
+	all := make([]uint32, 0, len(plan.chain)+len(plan.guessed))
+	all = append(all, plan.chain...)
+	all = append(all, plan.guessed...)
+	if logger != nil {
+		logger.Debug("restore cluster list",
+			slog.String("entry", entry.Path),
+			slog.String("dst", dst),
+			slog.Int("chain", len(plan.chain)),
+			slog.Int("guessed", len(plan.guessed)),
+			slog.Uint64("data_length", entry.DataLength),
+			slog.Any("clusters", all))
 	}
 
 	// 父目录按需建出来；dst 是设备节点时 filepath.Dir 返回已存在的目录，MkdirAll 是空操作。
@@ -357,7 +454,7 @@ func writePlan(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, plan 
 	defer out.Close()
 
 	left := entry.DataLength
-	for _, cid := range plan.chain {
+	for _, cid := range all {
 		chunk, err := parser.ReadCluster(cid)
 		if err != nil {
 			return res, fmt.Errorf("read cluster %d: %w", cid, err)
@@ -418,6 +515,7 @@ type RestoreSummary struct {
 	Restored   int    // 真正写出数据的条数
 	Full       int    // 其中整份恢复的
 	Partial    int    // 其中只恢复了前半段的
+	Carved     int    // 其中靠猜补了后半段的：数据是蒙的，必须人工确认过才能用
 	Failed     int    // 一个字节都没拿到的
 	Bytes      uint64 // 写出数据的总字节数
 }
@@ -433,7 +531,9 @@ type RestoreSummary struct {
 //
 // 输出落在 outRoot 下，路径沿用条目在卷上的位置（outRoot/a/b/c.txt）。只有「列出目录项」
 // 失败才算错误；一个都没恢复出来是正常结果，由返回的汇总说明。
-func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterState, owners ClusterOwner, outRoot string, pre string, logger *slog.Logger) (RestoreSummary, error) {
+// stats 是空闲簇扫描的索引，往后传给 RestoreFile：链断在 DataLength 之前的文件靠它续接。
+// 传 nil 就只写元数据能确认的那前半段。
+func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterState, owners ClusterOwner, stats *ScanStats, outRoot string, pre string, logger *slog.Logger) (RestoreSummary, error) {
 	entries, err := parser.ListAllFileEntries()
 	if err != nil {
 		return RestoreSummary{}, fmt.Errorf("list file entries: %w", err)
@@ -459,6 +559,10 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 		slog.Int("deleted_dirs", deletedDirs),
 		slog.Int("system_junk", junk),
 		slog.Int("candidates", deleted-deletedDirs-junk))
+
+	// 认领表：簇号 → 谁先用了它。chain 里的簇和猜出来的簇都要登记，否则两个残缺
+	// 文件会把同一簇各自写进自己的输出，两份都是错的。
+	claims := make(map[uint32]string)
 
 	var sum RestoreSummary
 	var lastErr error
@@ -488,7 +592,7 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 			continue
 		}
 
-		res, err := RestoreFile(parser, e, state, owners, dst)
+		res, err := RestoreFile(parser, e, state, owners, stats, claims, dst, logger)
 		if err != nil {
 			logRestoreFailed(logger, pre, e.Path, err)
 			lastErr = err
@@ -505,6 +609,16 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 
 		sum.Restored++
 		sum.Bytes += res.Bytes
+		if res.Carved > 0 {
+			// 后半段是猜的：数量单独记一笔，免得恢复报告看着跟整份恢复出来一样。
+			sum.Carved++
+			logger.Warn("carved clusters appended", slog.String("pre", pre),
+				slog.String("entry", e.Path),
+				slog.Int("carved_clusters", res.Carved),
+				slog.Uint64("bytes", res.Bytes),
+				slog.Uint64("want_bytes", e.DataLength),
+				slog.String("dst", dst))
+		}
 		if res.Truncated {
 			sum.Partial++
 			logRestorePartial(logger, pre, e.Path, e.DataLength, dst, res)
@@ -555,6 +669,30 @@ func logRestorePartial(logger *slog.Logger, pre, path string, want uint64, dst s
 			slog.Bool("cluster_released", s.LastFatNext == 0))
 	}
 	logger.Warn("restore file partial", attrs...)
+}
+
+// logFirstClusterBad 记一条「第一簇被污染，整个条目放弃」的告警。
+//
+// 判据必须摊成字段，不能只留错误字符串：事后要统计的是「这批文件被什么类型的
+// 数据盖掉的」（scanned_as），以及「压根没有 SOI 还是 SOI 不在开头」（soi_offset）——
+// 前者说明整个簇被覆写，后者说明这一簇是别人文件的中间段，两种的处理方式不一样。
+func logFirstClusterBad(logger *slog.Logger, entry fsinit.FileEntryItem, cid uint32, err error) {
+	if logger == nil {
+		return
+	}
+	attrs := []any{
+		slog.String("entry", entry.Path),
+		slog.Uint64("first_cluster", uint64(cid)),
+		slog.Uint64("data_length", entry.DataLength),
+		slog.Bool("no_fat_chain", entry.NoFatChain),
+	}
+	if fc, ok := err.(*FirstClusterError); ok {
+		attrs = append(attrs,
+			slog.String("scanned_as", fc.Kind.String()),
+			slog.Int("soi_offset", fc.SOIOffset))
+	}
+	attrs = append(attrs, slog.Any("err", err))
+	logger.Warn("first cluster is corrupted, entry skipped", attrs...)
 }
 
 // logRestoreFailed 记一条「一个字节都没救回来」的错误：链头被占、链本身对不上、
@@ -636,26 +774,9 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 		return err
 	}
 
-	// 把所有可恢复的已删除文件捞出来，按原路径落到 outRoot 下。
-	sum, err := RestoreAllDeleted(parser, state, owners, outRoot, pre, logger)
-	if err != nil {
-		logger.Error("restore deleted files err", slog.String("pre", pre),
-			slog.Any("err", err), slog.String("path", path), slog.String("out_root", outRoot))
-		return err
-	}
-
-	// full / partial 分开报：残缺的那几份得人工确认过才能用。
-	logger.Info("restore deleted files done", slog.String("pre", pre),
-		slog.Int("candidates", sum.Candidates),
-		slog.Int("restored", sum.Restored),
-		slog.Int("full", sum.Full),
-		slog.Int("partial", sum.Partial),
-		slog.Int("failed", sum.Failed),
-		slog.Uint64("bytes", sum.Bytes),
-		slog.String("out_root", outRoot))
-
-	// 恢复先跑完，再做空闲簇扫描：扫描要把整张卡的空闲簇读一遍（1TB 得一阵子），
-	// 放在后面不挡文件落地。
+	// 先把空闲簇扫一遍，再恢复：断链文件（FAT 被删文件时清空，只剩第一簇）要靠
+	// 扫描出来的内容特征索引去续后半段。代价是文件落地要等这一遍扫描（1TB 得一阵子），
+	// 换的是那些「只有第一簇」的照片能救回整张。
 	stats := Scan(parser, state, pre, logger)
 	logger.Info("scan free clusters done",
 		append([]any{
@@ -663,6 +784,25 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 			slog.Int("scanned", stats.Scanned),
 			slog.Int("read_failed", stats.ReadFailed),
 		}, hitAttrs(stats.Hits)...)...)
+
+	// 把所有可恢复的已删除文件捞出来，按原路径落到 outRoot 下。
+	sum, err := RestoreAllDeleted(parser, state, owners, &stats, outRoot, pre, logger)
+	if err != nil {
+		logger.Error("restore deleted files err", slog.String("pre", pre),
+			slog.Any("err", err), slog.String("path", path), slog.String("out_root", outRoot))
+		return err
+	}
+
+	// full / partial / carved 分开报：残缺的和靠猜补上的都得人工确认过才能用。
+	logger.Info("restore deleted files done", slog.String("pre", pre),
+		slog.Int("candidates", sum.Candidates),
+		slog.Int("restored", sum.Restored),
+		slog.Int("full", sum.Full),
+		slog.Int("partial", sum.Partial),
+		slog.Int("carved", sum.Carved),
+		slog.Int("failed", sum.Failed),
+		slog.Uint64("bytes", sum.Bytes),
+		slog.String("out_root", outRoot))
 
 	logger.Info("recovery end", slog.String("pre", pre), slog.String("path", path))
 	return nil
