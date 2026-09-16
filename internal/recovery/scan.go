@@ -9,22 +9,22 @@ import (
 	fsinit "progrescarve/internal/fs/finit"
 )
 
-// ScanStats 是空闲簇扫描的运行统计与结果索引。I/O 计数归恢复层；分类词表在 feature 包。
-// Hits 记簇号而不是只记个数：碎片重组阶段要按簇号重读命中簇，个数用 len 就有。
+// ScanStats 是空闲簇扫描的统计和结果索引。I/O 计数归恢复层，分类词表在 feature 包。
+//
+// Hits 和 Index 是同一批命中的两种看法：Hits 按类别遍历（日志、候选集），
+// Index 按簇号反查（续接时要判断某一簇能不能用）。两者都只记簇号和特征，
+// 不保存原始簇数据 —— 整卡空闲簇上百万，留住数据就是几十 GB，要用再按簇号回读。
 type ScanStats struct {
 	Scanned    int                       // 实际扫了的空闲簇数
 	ReadFailed int                       // 读不出来、没参与统计的簇
 	Hits       map[feature.Kind][]uint32 // 各分类命中的簇号；feature.KindNone 不计入
-	Index      map[uint32]feature.Hit    // 簇号 → 命中详情：续接要按簇号反查特征
+	Index      map[uint32]feature.Hit    // 簇号 → 命中详情，续接时按簇号反查
 
 	// ScannedUpTo 是派发出去读过、且位图上空闲的最大簇号。
-	// 有它才能区分两种「索引里查不到」：扫过但什么都不像（这一簇已被污染）vs
-	// 压根没扫到（不作判断）。派发是按簇号升序走的，所以 ≤ 它且空闲的簇都读过。
+	//
+	// 有它才能区分两种「索引里查不到」：扫过但什么都不像（这一簇已被污染）对比
+	// 压根没扫到（不作判断）。派发是按簇号升序走的，所以「空闲且簇号 ≤ 它」= 读过。
 	ScannedUpTo uint32
-
-	// Hits 和 Index 是同一批命中的两种看法：Hits 按类别遍历（日志、候选集），
-	// Index 按簇号反查（续接时判断某一簇能不能用）。都没保存原始簇数据 —— 整卡
-	// 空闲簇上百万，留数据就是几十 GB；要用再按簇号回读。
 }
 
 // HitAt 按簇号取命中详情。没命中的簇不在索引里（KindNone 不入表），ok 为 false。
@@ -135,8 +135,8 @@ dispatch:
 	close(jobs)
 	wg.Wait()
 
-	// 派发在主 goroutine，写 sum 的其它字段都上了锁；这个等 worker 都收工了再写，
-	// 省得为了一个字段再加一把锁（-workers 已经不会碰它了）。
+	// 派发在主 goroutine，写 sum 的其它字段都上了锁；这个等 worker 全部收工后再写，
+	// 省得为了一个字段再多一把锁 —— 这时候已经没人跟主 goroutine 抢了。
 	sum.ScannedUpTo = lastDispatched
 
 	// 并发完成顺序不固定，簇号列表排回来，进度日志和最终结果才可 diff。

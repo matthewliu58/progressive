@@ -9,6 +9,17 @@ import (
 	fsinit "progrescarve/internal/fs/finit"
 )
 
+// 本文件只干一件事：链断了、后半段没有任何指针可达时，靠内容特征把后续碎片
+// 猜回来（carving）。
+//
+// 边界先说清楚，免得用错：
+//   - 这里只挑候选，不证明接对了。熵编码流里任意字节都能接任意字节，特征只能否决、
+//     不能确认；猜出来的簇一律记进 chainPlan.guessed，写盘时单独标出来。
+//   - 已知事实优先于任何打分：目录项给了 DataLength（拼够就停）和 NoFatChain
+//     （连续分配，planChain 已经按自增走过了）。打分只在这些事实都断掉之后才上场。
+//   - 猜不出来就返回 nil。宁可少给，别给错的 —— 错的字节混在前半段完好的数据里，
+//     比少给几簇难发现得多。
+
 // expectsJPEG 按扩展名判断这个文件「按理说」该是 JPEG。
 //
 // 只有先有预期，才敢因为内容不像就判失败：卷上还有 mp4、txt 这些我们不认识的格式，
@@ -55,17 +66,6 @@ func checkFirstCluster(stats *ScanStats, state map[uint32]ClusterState,
 	}
 	return fc
 }
-
-// 这个文件的活只有一件：链断了、后半段没有任何指针可达时，靠内容特征把后续碎片
-// 猜回来（carving）。
-//
-// 边界先说清楚，免得用错：
-//   - 这里只挑候选，不证明接对了。熵编码流里任意字节都能接任意字节，特征只能否决、
-//     不能确认；猜出来的簇一律记进 chainPlan.guessed，写盘时单独标出来。
-//   - 已知事实优先于任何打分：目录项给了 DataLength（拼够就停）和 NoFatChain
-//     （连续分配，planChain 已经按自增走过了）。打分只在这些事实都断掉之后才上场。
-//   - 猜不出来就返回 nil。宁可少给，别给错的 —— 错的字节混在前半段完好的数据里，
-//     比少给几簇难发现得多。
 
 const (
 	// carveWindow 是「下一簇」的搜寻窗口（簇数）。连续分配是常态，不连续时分配器
@@ -169,7 +169,10 @@ func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 			best, bestScore = cid, score
 		}
 	}
-	// todo 这种只挑一个的方法不行 要用遍历树 但是如何 减枝 很重要 而且还要配合一个 关系graph 这样可以回溯 后期的逻辑很复杂!
+	// TODO(只挑最高分不够)：现在每步取分数最高的那一个，是贪心，不是搜索 ——
+	// 一步走错后面全错，而且没法回头。正经做法是遍历成树：每一步保留若干个候选
+	// （beam），配合一张「谁可能接在谁后面」的关系图，走不通就回溯到上一个分叉。
+	// 难点在剪枝：候选一多就爆炸，得拿解码器之类的硬判据来砍，光靠打分砍不动。
 	if best == 0 || bestScore < carveMinScore {
 		return 0, false
 	}

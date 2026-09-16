@@ -1,25 +1,22 @@
-// Package jpeg provides lightweight JPEG fragment detection and
-// adjacency scoring for file carving.
+// Package jpeg 判断一簇数据像不像 JPEG，并给「两簇是否相邻」打分，供文件雕刻使用。
 //
-// Design:
-//   - The original cluster data is NOT retained in memory.
-//   - Scan() extracts a compact Feature from each cluster.
-//   - IsLikelyJPEG() performs a loose candidate filter.
-//   - ScoreNext(a, b) estimates whether cluster b is likely to follow a.
+// 设计前提：
+//   - 不保留原始簇数据。整卡空闲簇上百万，留在内存里就是几十 GB；
+//   - Scan 从一簇里提取出紧凑的 Feature，随即可以丢掉原始数据；
+//   - IsLikelyJPEG 只做宽松的候选筛选，不是 JPEG 校验器；
+//   - ScoreNext(a, b) 估计「b 紧跟在 a 后面」的可能性有多大。
 //
-// This package does NOT prove that two clusters belong to the same JPEG.
-// It only provides evidence for a higher-level carving algorithm.
+// 这个包不能证明两簇属于同一个 JPEG —— 熵编码流里任意字节都能接任意字节，
+// 它只能给上层的雕刻算法提供证据（能用来否决，不能用来确认）。
 package jpeg
 
 import "math"
 
-// IsJPEGHeader reports whether data starts with a JPEG SOI followed by
-// a marker prefix:
+// IsJPEGHeader 判断 data 是不是以 JPEG 的起始标记开头，即：
 //
 //	FF D8 FF
 //
-// This should only be used for the beginning of a JPEG file.
-// For later fragments, the absence of this header is normal.
+// 只适用于文件的第一簇。后续碎片本来就没有这个头，判不出来是正常现象。
 func IsJPEGHeader(data []byte) bool {
 	return len(data) >= 3 &&
 		data[0] == 0xFF &&
@@ -27,81 +24,64 @@ func IsJPEGHeader(data []byte) bool {
 		data[2] == 0xFF
 }
 
-// Feature is a compact summary of one cluster.
+// Feature 是一簇数据的紧凑摘要。
 //
-// It is intentionally small because millions of clusters may need to be
-// indexed simultaneously. The original cluster bytes are not retained.
+// 之所以要紧凑：整卡空闲簇上百万，要同时建索引，原始簇数据一律不留。
 //
-// Fields are divided into three groups:
+// 字段分三组，各管一个问题，别混着用：
 //
-//  1. JPEG-likeness:
-//     FFCount, StuffedCount, RestartCount, Entropy
+//  1. 像不像 JPEG：FFCount、StuffedCount、RestartCount、Entropy
+//  2. JPEG 的结构：SOIOffset、EOIOffset、重启标记那几个
+//  3. 簇边界：TailFF、HeadMarker
 //
-//  2. JPEG structure:
-//     SOIOffset, EOIOffset, RST information
-//
-//  3. Cluster-boundary information:
-//     TailFF, HeadMarker
-//
-// The offsets are relative to the beginning of this cluster.
+// 所有偏移都是相对本簇开头的。
 type Feature struct {
-	// Basic block information.
+	// 本簇的字节数。
 	BlockSize int
 
-	// JPEG entropy-stream statistics.
+	// 熵编码流的统计量。
 	FFCount      int
-	StuffedCount int // FF 00
-	RestartCount int // FF D0 ~ FF D7
+	StuffedCount int // FF 00 填充：熵编码里的 0xFF 后面必须补一个 0x00
+	RestartCount int // FF D0 ~ FF D7 重启标记的个数
 	Entropy      float64
 
-	// JPEG markers found inside the cluster.
-	//
-	// -1 means the marker does not occur in this cluster.
-	SOIOffset int // FF D8
-	EOIOffset int // FF D9
+	// 簇内找到的 JPEG 标记位置，-1 表示这一簇里没有。
+	SOIOffset int // FF D8 起始标记
+	EOIOffset int // FF D9 结束标记
 
-	// Restart-marker information.
+	// 重启标记信息。
 	//
-	// FirstRST / LastRST are restart phases 0~7.
-	// The phase sequence normally follows:
+	// FirstRST / LastRST 是重启编号 0~7，正常按下面这样循环递增：
 	//
-	//     RST0 -> RST1 -> ... -> RST7 -> RST0
+	//	RST0 -> RST1 -> …… -> RST7 -> RST0
 	//
 	FirstRST int8
 	LastRST  int8
 
-	// Absolute offsets of the first and last restart markers.
+	// 首个和末个重启标记在簇内的绝对偏移。
 	//
-	// These are useful when comparing the end of A with the beginning
-	// of B without retaining the cluster itself.
+	// 有了它，不必保留簇内容也能拿「A 的尾巴」和「B 的头」比距离。
 	FirstRSTOffset int
 	LastRSTOffset  int
 
-	// Distance between the first two restart markers in this cluster.
+	// 簇内头两个重启标记之间的字节距离。
 	//
-	// 0 means fewer than two restart markers were observed.
+	// 0 表示这一簇里的重启标记不足两个，量不出来。
 	RSTGap int
 
-	// Boundary information.
-	//
-	// TailFF means the final byte is FF. The following byte may be in the
-	// next cluster and could therefore complete either FF 00 or FF marker.
+	// 簇尾是一个孤立的 0xFF：标记或填充被簇边界切开了，
+	// 它的后半个字节在下一簇头上，可能补成 FF 00，也可能补成某个标记。
 	TailFF bool
 
-	// HeadMarker means the cluster starts with FF followed by a non-zero
-	// byte. This can indicate that the cluster begins exactly at a JPEG
-	// marker boundary.
+	// 簇首是 0xFF 且后面不是 0x00：说明这一簇正好从一个标记边界开始，
+	// 而不是接在上半个字节后面。
 	HeadMarker bool
 }
 
-// Scan extracts all useful JPEG features in one pass.
+// Scan 一趟扫完，把这一簇里有用的 JPEG 特征全提出来。
 //
-// The caller should normally read one cluster into a temporary buffer:
-//
-//	data -> Scan(data) -> discard(data)
-//
-// Therefore the scanner does not require the entire disk to be resident
-// in memory.
+// 调用方通常是这样用的：读一簇到临时缓冲 → Scan(data) → 丢掉 data。
+// 所以扫描过程不需要整张盘常驻内存。
 func Scan(data []byte) Feature {
 	f := Feature{
 		BlockSize:      len(data),
@@ -119,7 +99,7 @@ func Scan(data []byte) Feature {
 
 	var freq [256]int
 
-	// Offset of the previous RST marker.
+	// 上一个重启标记的偏移，用来算相邻间距。
 	prevRSTOffset := -1
 
 	for i := 0; i < len(data); i++ {
@@ -132,8 +112,7 @@ func Scan(data []byte) Feature {
 
 		f.FFCount++
 
-		// FF is the final byte of this cluster.
-		// The next byte belongs to the next cluster.
+		// 0xFF 是本簇最后一个字节，它的后半个字节在下一簇，看不见就不猜。
 		if i+1 >= len(data) {
 			continue
 		}
@@ -142,23 +121,23 @@ func Scan(data []byte) Feature {
 
 		switch {
 		case next == 0x00:
-			// JPEG entropy-coded data uses FF 00 to represent a literal FF.
+			// 熵编码数据里的 0xFF 一律写成 FF 00。
 			f.StuffedCount++
 
 		case next == 0xD8:
-			// SOI.
+			// 起始标记 SOI。
 			if f.SOIOffset < 0 {
 				f.SOIOffset = i
 			}
 
 		case next == 0xD9:
-			// EOI.
+			// 结束标记 EOI。
 			if f.EOIOffset < 0 {
 				f.EOIOffset = i
 			}
 
 		case next >= 0xD0 && next <= 0xD7:
-			// Restart marker.
+			// 重启标记 RSTn。
 			phase := int8(next - 0xD0)
 
 			if f.FirstRST < 0 {
@@ -167,8 +146,7 @@ func Scan(data []byte) Feature {
 			}
 
 			if prevRSTOffset >= 0 && f.RSTGap == 0 {
-				// Keep the first observed RST interval as the
-				// representative interval for this cluster.
+				// 只取第一对间距当这一簇的代表间距：有节奏的流每对都一样。
 				f.RSTGap = i - prevRSTOffset
 			}
 
@@ -180,7 +158,7 @@ func Scan(data []byte) Feature {
 		}
 	}
 
-	// Boundary state.
+	// 簇边界状态：能不能和邻簇咬合，就看这两位。
 	f.TailFF = data[len(data)-1] == 0xFF
 
 	f.HeadMarker =
@@ -192,23 +170,19 @@ func Scan(data []byte) Feature {
 	return f
 }
 
-// HasRSTRhythm reports whether the cluster contains enough restart markers
-// to provide an internal restart interval estimate.
+// HasRSTRhythm 判断这一簇里的重启标记够不够多，能不能据此估出内部的重启间隔。
 func HasRSTRhythm(f Feature) bool {
 	return f.RestartCount >= 2 && f.RSTGap > 0
 }
 
-// IsLikelyJPEG performs a loose candidate filter for non-header fragments.
+// IsLikelyJPEG 给「非文件头的碎片」做宽松的候选筛选。
 //
-// This is deliberately NOT a JPEG validator.
+// 它刻意不是 JPEG 校验器 —— 只负责把候选挑出来，后续再做碎片分析。
 //
-// The main signal is FF 00 stuffing density. Random compressed data can
-// occasionally contain FF 00, so this only selects candidates for later
-// fragment analysis.
+// 主信号是 FF 00 填充的密度。随机压缩数据也会偶尔出现 FF 00，所以只能当筛选。
 //
-// The threshold is intentionally conservative enough to avoid requiring
-// restart markers, because many JPEG encoders do not enable restart
-// intervals.
+// 阈值取得刻意宽松，不依赖重启标记：很多编码器压根不开重启间隔，
+// 要求有重启标记才能入选会漏掉绝大多数照片。
 func IsLikelyJPEG(f Feature) bool {
 	if f.BlockSize == 0 {
 		return false
@@ -218,28 +192,25 @@ func IsLikelyJPEG(f Feature) bool {
 		float64(f.StuffedCount)/float64(f.BlockSize) >= 1.0/2048.0
 }
 
-// IsJPEGStart reports whether this cluster contains a JPEG SOI.
-//
-// This is useful when identifying the first cluster of a recovered file.
+// IsJPEGStart 判断这一簇里有没有出现 JPEG 起始标记 SOI。
+// 用来认「这是不是某个文件的第一簇」。
 func IsJPEGStart(f Feature) bool {
 	return f.SOIOffset >= 0
 }
 
-// IsJPEGEnd reports whether this cluster contains a JPEG EOI.
-//
-// This is useful when identifying the final cluster of a recovered file.
+// IsJPEGEnd 判断这一簇里有没有出现 JPEG 结束标记 EOI。
+// 用来认「这是不是某个文件的最后一簇」。
 func IsJPEGEnd(f Feature) bool {
 	return f.EOIOffset >= 0
 }
 
-// RSTPhaseNext reports whether b's first restart marker is the phase that
-// normally follows a's last restart marker.
+// RSTPhaseNext 判断 b 的首个重启标记，是不是正好接在 a 的末个重启标记后面。
 //
-// JPEG restart markers normally cycle:
+// 重启标记按下面这样循环递增：
 //
-//	RST0 -> RST1 -> ... -> RST7 -> RST0
+//	RST0 -> RST1 -> …… -> RST7 -> RST0
 //
-// The result is false when either cluster has no usable RST information.
+// 两边只要有一边没有可用的重启标记信息，就返回 false（没有信息不等于接对了）。
 func RSTPhaseNext(a, b Feature) bool {
 	if a.LastRST < 0 || b.FirstRST < 0 {
 		return false
@@ -249,13 +220,13 @@ func RSTPhaseNext(a, b Feature) bool {
 	return b.FirstRST == expected
 }
 
-// RSTGapRatio measures how similar the restart intervals of two clusters are.
+// RSTGapRatio 比较两簇各自的重启间隔有多接近。
 //
-// Returns:
+// 返回值：
 //
-//   - 0 when there is insufficient information.
-//   - 1 when the intervals are identical.
-//   - values approaching 0 when they are very different.
+//   - 信息不足：0
+//   - 两个间隔一样：1
+//   - 差得越远，越接近 0
 func RSTGapRatio(a, b Feature) float64 {
 	if a.RSTGap <= 0 || b.RSTGap <= 0 {
 		return 0
@@ -274,7 +245,7 @@ func RSTGapRatio(a, b Feature) float64 {
 	return minGap / maxGap
 }
 
-// StuffedDensity returns the density of FF 00 pairs in this cluster.
+// StuffedDensity 返回这一簇里 FF 00 的密度。
 func StuffedDensity(f Feature) float64 {
 	if f.BlockSize <= 0 {
 		return 0
@@ -283,8 +254,8 @@ func StuffedDensity(f Feature) float64 {
 	return float64(f.StuffedCount) / float64(f.BlockSize)
 }
 
-// FF density is kept separate from StuffedDensity because it can provide
-// a weaker but sometimes useful fallback signal.
+// FFDensity 单独留一份 0xFF 的密度，不跟 StuffedDensity 混：
+// 它更弱，但有时候能当个兜底信号。
 func FFDensity(f Feature) float64 {
 	if f.BlockSize <= 0 {
 		return 0
@@ -293,27 +264,22 @@ func FFDensity(f Feature) float64 {
 	return float64(f.FFCount) / float64(f.BlockSize)
 }
 
-// AdjacentScore estimates whether b is likely to immediately follow a.
+// ScoreNext 估计 b 紧跟在 a 后面的可能性有多大。
 //
-// The score is directional:
+// 分数是有方向的：ScoreNext(a, b) 问的是「A → B 有多说得通」。
 //
-//	ScoreNext(a, b)
+// 它刻意不返回布尔值。碎片恢复本来就是不确定的事，几条弱证据合起来打分，
+// 比硬判「是/否」更贴近现实。
 //
-// means "how plausible is A -> B?"
+// 大致这么看：
 //
-// It deliberately does NOT return a boolean. Fragment recovery is uncertain,
-// and several weak pieces of evidence are better combined into a score.
+//	>= 8   很强的候选
+//	5~8    不错的候选
+//	2~5    有可能
+//	< 2    偏弱
+//	< 0    明显冲突
 //
-// Rough interpretation:
-//
-//	>= 8   strong candidate
-//	5~8    good candidate
-//	2~5    possible
-//	< 2    weak
-//	< 0    strong conflict
-//
-// These thresholds are starting points only and should be tuned against
-// recovered JPEGs.
+// 这些阈值只是起点，得拿真恢复出来的 JPEG 对过再调。
 func ScoreNext(a, b Feature) float64 {
 	if a.BlockSize == 0 || b.BlockSize == 0 {
 		return -math.MaxFloat64
@@ -322,60 +288,54 @@ func ScoreNext(a, b Feature) float64 {
 	score := 0.0
 
 	// ------------------------------------------------------------
-	// 1. Hard-ish structural conflicts.
+	// 一、结构性冲突（最接近硬判据的部分）
 	// ------------------------------------------------------------
 
-	// If A contains EOI, it normally terminates a JPEG.
-	// Therefore another ordinary JPEG fragment should not follow it.
+	// A 里有 EOI：这个 JPEG 到它为止，后面不该再接普通碎片。
 	if a.EOIOffset >= 0 {
 		return -100
 	}
 
-	// If B contains SOI, it is normally the beginning of a JPEG.
-	// It therefore should not normally follow an ordinary middle fragment.
+	// B 里有 SOI：那是另一个 JPEG 的开头，不该接在别人的中间碎片后面。
 	if b.SOIOffset >= 0 {
 		score -= 20
 	}
 
 	// ------------------------------------------------------------
-	// 2. JPEG boundary evidence.
+	// 二、簇边界上的证据
 	// ------------------------------------------------------------
 
-	// A ending in FF is interesting because the next byte may be in B.
+	// A 以 0xFF 结尾：说明那个字节的后半在 B 里。最强的情况是
 	//
-	// The strongest case is:
+	//	A: …… FF
+	//	B: 00 ……
 	//
-	//     A: ... FF
-	//     B: 00 ...
-	//
-	// However, we intentionally do not require B[0] here because Feature
-	// does not retain the raw first byte. The actual bytes can be checked
-	// later when this edge becomes a high-confidence candidate.
+	// 这里刻意不去校验 B[0]，因为 Feature 没保留原始首字节。
+	// 等这条边成为高置信候选时，再回读原始字节核对。
 	if a.TailFF {
 		score += 0.5
 	}
 
-	// B starting at a marker boundary is weak positive evidence that the
-	// cluster may begin at a meaningful JPEG boundary.
+	// B 从一个标记边界开始：弱正向证据，说明它可能正好起于一个有意义的边界。
 	if b.HeadMarker {
 		score += 0.25
 	}
 
 	// ------------------------------------------------------------
-	// 3. Restart phase continuity.
+	// 三、重启标记的编号连续性
 	// ------------------------------------------------------------
 
 	if a.LastRST >= 0 && b.FirstRST >= 0 {
 		if RSTPhaseNext(a, b) {
 			score += 4.0
 		} else {
-			// Wrong phase is meaningful negative evidence.
+			// 编号接不上是实打实的反向证据。
 			score -= 3.0
 		}
 	}
 
 	// ------------------------------------------------------------
-	// 4. Restart interval similarity.
+	// 四、重启间隔的相似度
 	// ------------------------------------------------------------
 
 	if a.RSTGap > 0 && b.RSTGap > 0 {
@@ -394,11 +354,11 @@ func ScoreNext(a, b Feature) float64 {
 	}
 
 	// ------------------------------------------------------------
-	// 5. JPEG entropy-stream similarity.
+	// 五、熵编码流的相似度
 	// ------------------------------------------------------------
 
-	// Similar FF 00 density is useful, but deliberately weak.
-	// Two unrelated compressed streams can have similar statistics.
+	// FF 00 密度接近有点用，但刻意给得很弱：
+	// 两个毫不相干的压缩流也可能有相近的统计特征。
 	da := StuffedDensity(a)
 	db := StuffedDensity(b)
 
@@ -413,10 +373,7 @@ func ScoreNext(a, b Feature) float64 {
 		}
 	}
 
-	// Entropy is also only weak evidence.
-	//
-	// Do not require exact equality: JPEG blocks can have substantially
-	// different local image content.
+	// 熵同样只是弱证据。别要求相等：同一张图不同区域的局部内容差别可以很大。
 	if a.Entropy > 0 && b.Entropy > 0 {
 		diff := math.Abs(a.Entropy - b.Entropy)
 
@@ -431,8 +388,8 @@ func ScoreNext(a, b Feature) float64 {
 	return score
 }
 
-// HasStrongRSTEvidence reports whether A -> B has both restart-phase
-// continuity and compatible restart intervals.
+// HasStrongRSTEvidence 判断 A → B 是否同时满足「重启编号连得上」和「重启间隔对得上」，
+// 两条都成立才算强证据。
 func HasStrongRSTEvidence(a, b Feature) bool {
 	return a.LastRST >= 0 &&
 		b.FirstRST >= 0 &&
@@ -440,6 +397,7 @@ func HasStrongRSTEvidence(a, b Feature) bool {
 		RSTGapRatio(a, b) >= 0.80
 }
 
+// shannonEntropy 按字节频数算香农熵（bit/字节），只用来给相似度打分当参考。
 func shannonEntropy(freq []int, total int) float64 {
 	if total == 0 {
 		return 0

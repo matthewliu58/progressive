@@ -1,3 +1,14 @@
+// Package recovery 把卷上已删除的文件恢复出来。
+//
+// 四个文件各管一段：
+//
+//   - engine.go：主流程。识别文件系统 → 建簇状态表 → 扫空闲簇 → 恢复条目 → 写盘；
+//   - scan.go：把空闲簇并发读一遍，按内容分类，建出「簇号 → 特征」索引；
+//   - carve.go：目录项给的簇链断掉时，靠内容特征把后续碎片猜回来；
+//   - feature（上级包）：内容分类本身，跟文件系统无关。
+//
+// 贯穿全局的一条原则：元数据能确认的，优先于任何猜测；猜出来的部分一律单独记账，
+// 不和有指针可达的数据混为一谈。
 package recovery
 
 import (
@@ -324,7 +335,10 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 			need -= clusterSize
 		}
 
-		// todo 这里面也有问题因为也不确实顺序读出的是不是被污染的 有概率
+		// TODO(连续分配也要校验)：NoFatChain 只是说「当年是连续分配的」，不代表这些簇
+		// 现在还是当年的内容 —— 删除之后它们可能被别的数据写过。现在一路自增照单全收，
+		// 中间某一簇被污染的概率是有的。要修得对着扫描索引逐簇核（见 carve.go 的
+		// checkFirstCluster 那一套），发现不像就停。
 		if entry.NoFatChain {
 			cid++ // 连续分配，簇号自增，不用查 FAT
 			continue
@@ -344,7 +358,10 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 	}
 
 	// chain 里的簇是元数据确认可达的，先全部认领掉：别的文件续接时不能把它们抢走。
-	// todo 这里面有一些确认的也可能是假的 后续需要回溯
+	//
+	// TODO(认领也要能回退)：这里认领的是「元数据说可达」，不等于内容还对得上 ——
+	// 链本身可能是假的（条目损坏、FAT 串了）。等有了能回溯的搜索（见 carve.go 的
+	// TODO），认领就得跟着回溯一起回滚，不能一次认到底。
 	if claims != nil {
 		for _, cid := range plan.chain {
 			claims[cid] = entry.Path
@@ -368,7 +385,8 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 		if len(plan.chain) > 0 {
 			plan.guessed = carveChain(parser, stats, state, claims, plan.chain[len(plan.chain)-1], need, clusterSize)
 			if claims != nil {
-				// todo 暂时逻辑 这里面有一些确认的也可能是假的 后续需要回溯
+				// 猜出来的簇也要认领，否则两个残缺文件会把同一簇各自写进自己的输出。
+				// TODO(回溯)：猜错时要能把认领撤回来，现在是一次认到底，没有回头路。
 				for _, cid := range plan.guessed {
 					claims[cid] = entry.Path
 				}

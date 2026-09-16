@@ -12,16 +12,18 @@ import (
 	"unicode/utf16"
 )
 
+// 目录项类型。exFAT 用首字节区分：高位 0x80 是「在用」，删掉之后清成 0，
+// 于是同一类条目有「活」和「已删」两个值 —— 删没删就藏在这一位里。
 const (
-	sectorSize               = 512
-	entryTypeEnd             = 0x00
-	entryTypeFile            = 0x85
-	entryTypeFileDeleted     = 0x05
-	entryTypeStream          = 0xC0
-	entryTypeStreamDeleted   = 0x40
-	entryTypeFileName        = 0xC1
-	entryTypeFileNameDeleted = 0x41
-	entryTypeBitmap          = 0x81
+	sectorSize               = 512  // 扇区大小，exFAT 引导扇区的读取单位
+	entryTypeEnd             = 0x00 // 目录结束标记（也会出现在目录中间的空洞里）
+	entryTypeFile            = 0x85 // 文件目录项（在用）
+	entryTypeFileDeleted     = 0x05 // 文件目录项（已删除）
+	entryTypeStream          = 0xC0 // 流扩展目录项：第一簇、长度、连续分配标志都在这里
+	entryTypeStreamDeleted   = 0x40 // 流扩展目录项（已删除）
+	entryTypeFileName        = 0xC1 // 文件名目录项（在用）
+	entryTypeFileNameDeleted = 0x41 // 文件名目录项（已删除）
+	entryTypeBitmap          = 0x81 // 分配位图目录项，只有根目录里有
 
 	// attrDirectory 是 File 条目 Attributes 字段的「这是目录」位（bit 4）
 	attrDirectory = 0x0010
@@ -30,6 +32,7 @@ const (
 	maxDirDepth = 64
 )
 
+// BootInfo 是引导扇区里解析出来的卷参数。
 type BootInfo struct {
 	PartitionOffset      uint64 `json:"partition_offset"`
 	VolumeLength         uint64 `json:"volume_length"`
@@ -49,11 +52,13 @@ type BootInfo struct {
 	BootSignature        uint16 `json:"boot_signature"`
 }
 
+// BitmapInfo 是分配位图的位置：它自己也是簇堆里的一段数据。
 type BitmapInfo struct {
 	FirstCluster uint32 `json:"first_cluster"`
 	DataLength   uint64 `json:"data_length"`
 }
 
+// FileInfo 是一个目录项组（文件项 + 流扩展项 + 若干文件名项）解析出来的结果。
 type FileInfo struct {
 	Name            string `json:"name"`
 	Path            string `json:"path"`
@@ -67,6 +72,7 @@ type FileInfo struct {
 	IsDeleted       bool   `json:"is_deleted"`
 }
 
+// ExFATInfo 是一个卷解析完之后的全套元数据，恢复流程只需要读它，不再碰设备。
 type ExFATInfo struct {
 	Boot        BootInfo   `json:"boot"`
 	Bitmap      BitmapInfo `json:"bitmap"`
@@ -76,13 +82,14 @@ type ExFATInfo struct {
 	FAT         []uint32   `json:"fat"`
 }
 
-// exFatMetaFile 在 FileInfo 上补一个由 Attributes 推导出的 is_dir
+// exFatMetaFile 在 FileInfo 上补一个由 Attributes 推导出来的 is_dir，
+// 只用于日志输出，不参与恢复判断。
 type exFatMetaFile struct {
 	FileInfo
 	IsDir bool `json:"is_dir"`
 }
 
-// exFatMetaDump 是 DebugPrintMeta 打印的 JSON 结构
+// exFatMetaDump 是 DebugPrintMeta 打印出来的那个 JSON 的结构。
 type exFatMetaDump struct {
 	Boot   BootInfo        `json:"boot"`
 	Bitmap BitmapInfo      `json:"bitmap"`
@@ -125,18 +132,20 @@ func (f fatDump) MarshalJSON() ([]byte, error) {
 	return b.Bytes(), nil
 }
 
-// ExFatParser 实现 FileSystemParser
+// ExFatParser 实现 FileSystemParser 接口，只支持 exFAT 卷。
 type ExFatParser struct {
-	info   *ExFATInfo
-	f      *os.File
+	info   *ExFATInfo // Load 之后才有内容
+	f      *os.File   // 源设备，只在 Load 和 ReadCluster 里用
 	logger *slog.Logger
-	pre    string
+	pre    string // 日志前缀
 }
 
+// NewExFatParser 只建对象，不读盘；真正的解析在 Load 里。
 func NewExFatParser(pre string, logger *slog.Logger) *ExFatParser {
 	return &ExFatParser{logger: logger, pre: pre}
 }
 
+// Load 读一遍设备，把引导扇区、FAT、分配位图和整棵目录树都载入内存。
 func (p *ExFatParser) Load(f *os.File) error {
 	p.f = f
 
@@ -231,6 +240,8 @@ func (p *ExFatParser) Load(f *os.File) error {
 	return nil
 }
 
+// GetClusterFSInfo 给出一簇的两份信息：位图说占没占，FAT 说下一簇是谁。
+// 两份经常对不上（删文件时 FAT 项被清空，位图也跟着清），恢复逻辑就靠这个差异判断。
 func (p *ExFatParser) GetClusterFSInfo(cid uint32) (alloc bool, fatNext uint32, err error) {
 	alloc, err = IsClusterAllocated(cid, p.info.BitmapData)
 	if err != nil {
@@ -240,6 +251,8 @@ func (p *ExFatParser) GetClusterFSInfo(cid uint32) (alloc bool, fatNext uint32, 
 	return alloc, fatNext, nil
 }
 
+// IsClusterAllocated 查分配位图：cid 这一簇在位图里是不是标着「已占用」。
+// 位图从簇号 2 开始记（0、1 两个簇号不进位图），所以位序是 cid-2。
 func IsClusterAllocated(cid uint32, bitmapData []byte) (bool, error) {
 	if cid < 2 {
 		return false, fmt.Errorf("cluster id must >=2")
@@ -254,6 +267,8 @@ func IsClusterAllocated(cid uint32, bitmapData []byte) (bool, error) {
 	return (b & (1 << bitPos)) != 0, nil
 }
 
+// ListAllFileEntries 把内部的文件列表转成接口要求的条目：已删除的也在里面，
+// 恢复流程自己按 IsDeleted 挑。
 func (p *ExFatParser) ListAllFileEntries() ([]fsinit.FileEntryItem, error) {
 	var out []fsinit.FileEntryItem
 	for _, fi := range p.info.Files {
@@ -271,6 +286,8 @@ func (p *ExFatParser) ListAllFileEntries() ([]fsinit.FileEntryItem, error) {
 	return out, nil
 }
 
+// ClusterHeapRange 给出簇堆范围。exFAT 的合法簇号从 2 开始，
+// 所以区间是 [2, 2+ClusterCount)。
 func (p *ExFatParser) ClusterHeapRange() (clusterSize uint64, firstCluster uint32, totalCluster uint32) {
 	return p.info.ClusterSize, 2, p.info.Boot.ClusterCount
 }
@@ -318,6 +335,10 @@ func (p *ExFatParser) SystemClusters() []uint32 {
 	return out
 }
 
+// ReadCluster 读出一簇的原始内容。
+//
+// 走的是 ReadAt：位置无关、不挪动共享的文件偏移，所以多个 goroutine 可以并发调它，
+// 不用加锁 —— 扫描阶段八路并发读簇就靠这个。
 func (p *ExFatParser) ReadCluster(cid uint32) ([]byte, error) {
 	boot := p.info.Boot
 	off, err := clusterOffset(&boot, cid, p.info.ClusterSize)
@@ -329,6 +350,8 @@ func (p *ExFatParser) ReadCluster(cid uint32) ([]byte, error) {
 	return buf, err
 }
 
+// DebugPrintMeta 把解析出来的元数据整块打成一条 Debug 日志。
+// 只在排查卷本身的问题时看，日常恢复不用管。
 func (p *ExFatParser) DebugPrintMeta() {
 	logger := p.logger
 	if logger == nil {
@@ -384,6 +407,7 @@ func (p *ExFatParser) DebugPrintMeta() {
 	logger.Debug("exfat meta", slog.String("pre", p.pre), slog.Any("meta", json.RawMessage(b)))
 }
 
+// clusterOffset 把簇号换成设备上的字节偏移：簇堆起点 + (簇号-2) × 簇大小。
 func clusterOffset(boot *BootInfo, cluster uint32, clusterSize uint64) (uint64, error) {
 	if cluster < 2 {
 		return 0, fmt.Errorf("invalid cluster %d", cluster)
@@ -454,6 +478,8 @@ func parseDirectoryEntries(data []byte) (uint32, uint64, []FileInfo) {
 	return bitmapCluster, bitmapLength, outFiles
 }
 
+// parseFileEntrySet 解析一个目录项组：第一个是文件项，后面跟着流扩展项和若干文件名项。
+// 缺了流扩展项（没有第一簇和长度）就当解析失败 —— 这种条目恢复不出任何东西。
 func parseFileEntrySet(set []byte, isDeleted bool) (FileInfo, bool) {
 	var fi FileInfo
 	fi.IsDeleted = isDeleted
@@ -507,6 +533,8 @@ func parseFileEntrySet(set []byte, isDeleted bool) (FileInfo, bool) {
 	return fi, true
 }
 
+// readAllocationBitmap 读出分配位图。读的长度按扇区向上取整，
+// 最后截成位图自己声明的长度 —— 位图不是整扇区大小。
 func readAllocationBitmap(f *os.File, boot *BootInfo, bitmapCluster uint32, bitmapLen uint64, clusterSize uint64) ([]byte, error) {
 	if bitmapCluster < 2 {
 		return nil, fmt.Errorf("bitmap cluster invalid: %d", bitmapCluster)
@@ -525,10 +553,12 @@ func readAllocationBitmap(f *os.File, boot *BootInfo, bitmapCluster uint32, bitm
 	return buf[:bitmapLen], nil
 }
 
+// isDir 按 Attributes 的目录位判断：目录的簇链读出来是一堆目录项，不是文件内容。
 func (f FileInfo) isDir() bool {
 	return f.Attributes&attrDirectory != 0
 }
 
+// warn 记一条带前缀和路径的告警；logger 为空时什么都不做。
 func (p *ExFatParser) warn(msg, path string, err error) {
 	if p.logger == nil {
 		return
