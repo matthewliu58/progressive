@@ -126,35 +126,42 @@ func Scan(data []byte) Feature {
 
 		case next == 0xD8:
 			// 起始标记 SOI。
-			if f.SOIOffset < 0 {
+			// 空隙里的不算：EOI 之后躺着的是别的文件残骸，那里的 FF D8 跟本文件无关。
+			if f.SOIOffset < 0 && f.EOIOffset < 0 {
 				f.SOIOffset = i
 			}
 
 		case next == 0xD9:
-			// 结束标记 EOI。
+			// 结束标记 EOI。只认第一个：之后的字节已经不是这个流了。
 			if f.EOIOffset < 0 {
 				f.EOIOffset = i
 			}
 
 		case next >= 0xD0 && next <= 0xD7:
 			// 重启标记 RSTn。
-			phase := int8(next - 0xD0)
+			//
+			// 整段都在「流还没结束」的前提下才记：EOI 之后的空隙里同样能扫出
+			// FF D0~D7（上一个文件的数据），那是别人的节奏，混进来会把 RSTGap
+			// 和编号全带偏，打分就跟着错。
+			if f.EOIOffset < 0 {
+				phase := int8(next - 0xD0)
 
-			if f.FirstRST < 0 {
-				f.FirstRST = phase
-				f.FirstRSTOffset = i
+				if f.FirstRST < 0 {
+					f.FirstRST = phase
+					f.FirstRSTOffset = i
+				}
+
+				if prevRSTOffset >= 0 && f.RSTGap == 0 {
+					// 只取第一对间距当这一簇的代表间距：有节奏的流每对都一样。
+					f.RSTGap = i - prevRSTOffset
+				}
+
+				f.LastRST = phase
+				f.LastRSTOffset = i
+				f.RestartCount++
+
+				prevRSTOffset = i
 			}
-
-			if prevRSTOffset >= 0 && f.RSTGap == 0 {
-				// 只取第一对间距当这一簇的代表间距：有节奏的流每对都一样。
-				f.RSTGap = i - prevRSTOffset
-			}
-
-			f.LastRST = phase
-			f.LastRSTOffset = i
-			f.RestartCount++
-
-			prevRSTOffset = i
 		}
 	}
 
@@ -296,10 +303,17 @@ func ScoreNext(a, b Feature) float64 {
 		return -100
 	}
 
-	// B 里有 SOI：那是另一个 JPEG 的开头，不该接在别人的中间碎片后面。
-	if b.SOIOffset >= 0 {
-		score -= 20
+	// B 以 SOI 开头：它本身是另一个文件的第一簇，是硬冲突，跟「A 里有 EOI」一样判死。
+	if b.SOIOffset == 0 {
+		return -100
 	}
+
+	// B 里有 SOI 但不在开头：说明本文件在 B 中间就结束了，后面是空隙，
+	// 跟「A → B 相不相邻」没关系，不扣分。
+	//
+	// 这一条之前写成了「只要有 SOI 就扣 20 分」，于是所有最后一簇都被判成冲突 ——
+	// 它们的尾部空隙里常躺着上一个文件的 SOI。实测一对真正相邻的簇被打成 -17 分。
+	// 注意 Scan 那边也做了处理：EOI 之后的标记一律不认。
 
 	// ------------------------------------------------------------
 	// 二、簇边界上的证据
