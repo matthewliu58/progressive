@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"log/slog"
+	"slices"
 	"strings"
 
 	"progrescarve/internal/feature"
@@ -104,9 +105,14 @@ func checkFirstCluster(stats *ScanStats, state map[uint32]ClusterState,
 }
 
 const (
-	// carveWindow 是「下一簇」的搜寻窗口（簇数）。连续分配是常态，不连续时分配器
-	// 同一时段拿到的簇也是挨着的，不会跑到天边；窗口太大只会招来更多巧合候选。
-	carveWindow = 512
+	// carveWindow 是往后找碎片的簇号跨度。固定值，不随文件大小变。
+	//
+	// 不放大是实测换来的：分配器是一路往后写、中间被别的文件插几簇
+	// （实测 461 → 463 → 465 → 466，间隔 1~2 簇），间距由「插入了多少」决定，
+	// 跟文件多大没关系。放大窗口只会多招来无关候选，而打分分辨不出它们。
+	//
+	// 真要是遇到了更大的段间距，日志里的 dist 会一路贴着这个值 —— 到时候再调。
+	carveWindow = 256
 
 	// carveMinScore 是接受一个「非连续」候选的最低分。连续的 last+1 不看分 ——
 	// 那是分配器的默认行为，比任何打分都可靠。
@@ -196,7 +202,7 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 // pickNext 挑 last 的下一簇。
 //
 // 先试连续的 last+1：exFAT 分配器默认连续分配，这一种的命中率远高于任何打分，
-// 而且它是「分配器的行为」，不是统计巧合。连续的那簇不能用，才退到窗口里按分挑。
+// 而且它是「分配器的行为」，不是统计巧合。连续的那簇不能用，才去候选里按分挑。
 func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
 	used map[uint32]bool, prev *jpeg.Feature, last uint32,
 	logger *slog.Logger, path string) (uint32, bool) {
@@ -210,28 +216,58 @@ func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 		return cont, true
 	}
 
-	var best uint32
-	bestScore := 0.0
-	considered := 0
-	for cid := last + 2; cid <= last+carveWindow; cid++ {
+	// 候选到扫描索引里找，不去遍历簇号空间：后者绝大多数簇号压根不是候选，空转。
+	//
+	// Payloads 是扫描时判定为「JPEG 后续碎片」的簇，按簇号升序排好，二分定位到
+	// last+1，往后取、直到超出 carveWindow 的跨度为止。
+	//
+	// 只看后面，这是实测换来的：理论上分配器会回头填空隙（后续碎片簇号更小），
+	// 但放开双向之后立刻出现了 461 → 143 这种倒着接的错拼 —— 而那个错误候选的
+	// 分数（6.25）还比正确的（5.75）高。收益远抵不上代价，先卡死前向。
+	payloads := stats.Payloads()
+	pos, _ := slices.BinarySearch(payloads, last+1)
+	limit := last + carveWindow
+
+	// 谁在前由簇号距离说了算，分数只否决、不排序。
+	//
+	// 分配器一路往后写、中间被别的文件插几簇（实测 461 → 463 → 465 → 466，间隔
+	// 1~2 簇），所以下一片几乎总是最近的那个。而打分的分辨力撑不起排序 —— 实测
+	// 错候选 6.25 分反超正确候选 5.75 分 —— 让它排序等于把决定权交给掷骰子。
+	// 所以：分数不够的挡掉，剩下的取最近的（payloads 升序，第一个过线的就是最近的）。
+	var (
+		best       uint32
+		bestScore  float64
+		considered int
+		vetoed     int
+	)
+	for _, cid := range payloads[pos:] {
+		if cid > limit {
+			break
+		}
 		if !usable(stats, state, claims, used, cid) {
 			continue
 		}
 		h, _ := stats.HitAt(cid)
 		considered++
-		if score := jpeg.ScoreNext(*prev, *h.JPEG); score > bestScore {
-			best, bestScore = cid, score
+		score := jpeg.ScoreNext(*prev, *h.JPEG)
+		if score < carveMinScore {
+			vetoed++ // 分数不够：否决，接着看更远的那个
+			continue
 		}
+		best, bestScore = cid, score
+		break
 	}
-	// TODO(只挑最高分不够)：现在每步取分数最高的那一个，是贪心，不是搜索 ——
-	// 一步走错后面全错，而且没法回头。正经做法是遍历成树：每一步保留若干个候选
-	// （beam），配合一张「谁可能接在谁后面」的关系图，走不通就回溯到上一个分叉。
-	// 难点在剪枝：候选一多就爆炸，得拿解码器之类的硬判据来砍，光靠打分砍不动。
-	if best == 0 || bestScore < carveMinScore {
+	// TODO(贪心不够)：现在每步只挑一个就往下走，一步走错后面全错，也没法回头。
+	// 正经做法是遍历成树：每一步保留若干个候选（beam），走不通再回溯到上一个分叉。
+	// 难点在剪枝：候选一多就爆炸，得拿解码器之类的硬判据来砍，光靠打分砍不动 ——
+	// 实测错候选能比正确候选高出 0.5 分，这分辨力撑不起搜索。
+	if best == 0 {
 		return 0, false
 	}
 	logEdgeScore(logger, path, last, best, bestScore, "window",
-		slog.Int("candidates", considered))
+		slog.Int("candidates", considered),
+		slog.Int("vetoed", vetoed),
+		slog.Uint64("dist", uint64(best-last)))
 	return best, true
 }
 
