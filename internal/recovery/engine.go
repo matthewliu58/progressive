@@ -99,20 +99,20 @@ func (e *ShortChainError) Error() string {
 // 这种文件写出来只是多一个「看着像那么回事」的假阳性：没有 SOI 就没有任何解码器能
 // 打开它。宁可判失败、在日志里说清原因，也别让它混进输出目录。
 type FirstClusterError struct {
-	Cluster   uint32       // 目录项指向的第一簇
-	Kind      feature.Kind // 扫描判定它像什么；KindNone = 什么都不像
-	SOIOffset int          // 簇内 SOI 的偏移：-1 = 压根没有 SOI；>0 = 有，但不在簇首
-	Path      string       // 条目路径
+	Cluster    uint32       // 目录项指向的第一簇
+	Kind       feature.Kind // 扫描判定它像什么；KindNone = 什么都不像
+	HeadOffset int          // 文件头标记在簇内的偏移：-1 = 压根没有；>0 = 有，但不在簇首
+	Path       string       // 条目路径
 }
 
 func (e *FirstClusterError) Error() string {
-	// 两种「不是头」要说清：簇里压根没有 SOI（整个被盖成别的东西），
-	// 和有 SOI 但不在开头（这一簇其实是别人文件的中间段，尾部接了个新文件的头）。
-	where := "no SOI in cluster"
-	if e.SOIOffset >= 0 {
-		where = fmt.Sprintf("SOI at offset %d, not 0", e.SOIOffset)
+	// 两种「不是头」要说清：簇里压根没有文件头标记（整个被盖成别的东西），
+	// 和有标记但不在开头（这一簇其实是别人文件的中间段，尾部接了个新文件的头）。
+	where := "no file header in cluster"
+	if e.HeadOffset >= 0 {
+		where = fmt.Sprintf("header at offset %d, not 0", e.HeadOffset)
 	}
-	return fmt.Sprintf("first cluster %d of %q is not a JPEG head (%s, scanned as %s): overwritten after deletion",
+	return fmt.Sprintf("first cluster %d of %q is not a file head (%s, scanned as %s): overwritten after deletion",
 		e.Cluster, e.Path, where, e.Kind)
 }
 
@@ -392,8 +392,16 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 		// 就地续接：指针到这儿就断了，后半段只能按内容特征去找。last / want 这两个
 		// 数只有这一步最清楚，在这里把 list 组装好交给 writePlan，不在外面重算一遍。
 		if len(plan.chain) > 0 {
+			// 目标格式由第一簇定（认不出就按扩展名猜）：后续簇按这个格式去挑，
+			// 不再要求每一簇自己证明身份 —— 视频的 mdat 做不到。
+			format := feature.KindNone
+			if h, ok := stats.HitAt(entry.FirstCluster); ok {
+				format = h.Kind.FragmentKind()
+			} else if k := expectedFormat(entry.Path); k != feature.KindNone {
+				format = k.FragmentKind()
+			}
 			plan.guessed = carveChain(parser, stats, state, claims,
-				plan.chain[len(plan.chain)-1], need, clusterSize, logger, entry.Path)
+				plan.chain[len(plan.chain)-1], need, clusterSize, format, logger, entry.Path)
 			if claims != nil {
 				// 猜出来的簇也要认领，否则两个残缺文件会把同一簇各自写进自己的输出。
 				// TODO(回溯)：猜错时要能把认领撤回来，现在是一次认到底，没有回头路。
@@ -546,6 +554,11 @@ type RestoreSummary struct {
 	Carved     int    // 其中靠猜补了后半段的：数据是蒙的，必须人工确认过才能用
 	Failed     int    // 一个字节都没拿到的
 	Bytes      uint64 // 写出数据的总字节数
+
+	// 下面两个是 MP4 索引（moov）的探测统计，用来判断「按 moov 算簇序列」这条路
+	// 值不值得投入：探了多少个、其中几个还捞得着 moov。
+	MP4Probes   int // 参与探测的 MP4 条目数
+	MP4WithMoov int // 其中探到 moov 的
 }
 
 // RestoreAllDeleted 把卷上所有「已删除、且不是目录」的条目逐个恢复出来。
@@ -611,6 +624,21 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 			slog.String("entry", e.Path),
 			slog.Uint64("size", e.DataLength),
 			slog.Int("first_cluster", int(e.FirstCluster)))
+
+		// MP4 先探一下索引（moov）在不在、在第几簇。现在只探不打 ——
+		// 命中率够高的话，后续簇就能按 moov 的 chunk 偏移表算出来，不用猜。
+		if expectedFormat(e.Path) == feature.KindMP4Header {
+			sum.MP4Probes++
+			p := probeMoov(parser, e)
+			logMoovProbe(logger, pre, e.Path, p)
+			if p.Found() {
+				sum.MP4WithMoov++
+			}
+
+			// 把第一簇往后这一段的原始字节和判据摊开：后续簇判不成 MP4 时，
+			// 光看命中列表看不出那里装的是什么、卡在哪条判据上。
+			inspectEntrySpan(parser, logger, pre, e.Path, e.FirstCluster)
+		}
 
 		dst, err := outputPath(outRoot, e.Path)
 		if err != nil {
@@ -702,7 +730,7 @@ func logRestorePartial(logger *slog.Logger, pre, path string, want uint64, dst s
 // logFirstClusterBad 记一条「第一簇被污染，整个条目放弃」的告警。
 //
 // 判据必须摊成字段，不能只留错误字符串：事后要统计的是「这批文件被什么类型的
-// 数据盖掉的」（scanned_as），以及「压根没有 SOI 还是 SOI 不在开头」（soi_offset）——
+// 数据盖掉的」（scanned_as），以及「压根没有文件头还是头不在簇首」（head_offset）——
 // 前者说明整个簇被覆写，后者说明这一簇是别人文件的中间段，两种的处理方式不一样。
 func logFirstClusterBad(logger *slog.Logger, entry fsinit.FileEntryItem, cid uint32, err error) {
 	if logger == nil {
@@ -717,7 +745,7 @@ func logFirstClusterBad(logger *slog.Logger, entry fsinit.FileEntryItem, cid uin
 	if fc, ok := err.(*FirstClusterError); ok {
 		attrs = append(attrs,
 			slog.String("scanned_as", fc.Kind.String()),
-			slog.Int("soi_offset", fc.SOIOffset))
+			slog.Int("head_offset", fc.HeadOffset))
 	}
 	attrs = append(attrs, slog.Any("err", err))
 	logger.Warn("first cluster is corrupted, entry skipped", attrs...)
@@ -810,6 +838,7 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 		append([]any{
 			slog.String("pre", pre),
 			slog.Int("scanned", stats.Scanned),
+			slog.Int("scanned_unknown", stats.ScannedUnknown),
 			slog.Int("read_failed", stats.ReadFailed),
 		}, hitAttrs(stats.Hits)...)...)
 
@@ -830,6 +859,8 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 		slog.Int("carved", sum.Carved),
 		slog.Int("failed", sum.Failed),
 		slog.Uint64("bytes", sum.Bytes),
+		slog.Int("mp4_probes", sum.MP4Probes),
+		slog.Int("mp4_with_moov", sum.MP4WithMoov),
 		slog.String("out_root", outRoot))
 
 	logger.Info("recovery end", slog.String("pre", pre), slog.String("path", path))

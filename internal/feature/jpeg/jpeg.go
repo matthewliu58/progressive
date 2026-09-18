@@ -182,21 +182,49 @@ func HasRSTRhythm(f Feature) bool {
 	return f.RestartCount >= 2 && f.RSTGap > 0
 }
 
+// stuffedRatioMin 是「FF 后面跟 00」的最低比例，见 IsLikelyJPEG。
+const stuffedRatioMin = 0.5
+
+// StuffedRatio 返回这一簇里 FF 后面跟 00 的比例。
+//
+// 这是区分 JPEG 和视频数据的关键，比密度可靠得多：
+//   - JPEG 的熵编码流里，每个 0xFF 后面必须补一个 0x00 —— 比例接近 1；
+//   - H.264 之类的压缩流里 0xFF 只是碰巧出现，后面跟 00 的概率只有 1/256。
+//
+// 也就是说：JPEG 的 FF 00 是「规定出来的」，视频的 FF 00 是「撞出来的」。
+// 密度那条判据只看绝对数量，而视频里的 0xFF 一点也不少，挡不住。
+func StuffedRatio(f Feature) float64 {
+	if f.FFCount == 0 {
+		return 0
+	}
+	return float64(f.StuffedCount) / float64(f.FFCount)
+}
+
 // IsLikelyJPEG 给「非文件头的碎片」做宽松的候选筛选。
 //
 // 它刻意不是 JPEG 校验器 —— 只负责把候选挑出来，后续再做碎片分析。
 //
-// 主信号是 FF 00 填充的密度。随机压缩数据也会偶尔出现 FF 00，所以只能当筛选。
+// 三条判据，缺一不可：
+//  1. FF 00 的绝对数量够多（小样本不作数）；
+//  2. FF 00 的密度够高；
+//  3. **FF 后面跟 00 的比例够高**（StuffedRatio）。
 //
-// 阈值取得刻意宽松，不依赖重启标记：很多编码器压根不开重启间隔，
-// 要求有重启标记才能入选会漏掉绝大多数照片。
+// 第 3 条是实测补上的：只靠前两条时，一段 H.264 视频的 mdat 被成片判成 JPEG 碎片
+// —— 视频里 0xFF 不少，撞出 FF 00 的绝对数量和密度都能过线，但比例只有 1/256。
+//
+// 阈值不依赖重启标记：很多编码器压根不开重启间隔，要求有重启标记才能入选会漏掉
+// 绝大多数照片。
+//
+// 已知的边界：最后一簇通常只有一小截是图像数据、后面全是空隙，空隙里的 FF 没有
+// 补 00，比例会被拉低，可能判不过 —— 但最后一簇本来就不走这里（见 carve 的 tailOK）。
 func IsLikelyJPEG(f Feature) bool {
 	if f.BlockSize == 0 {
 		return false
 	}
 
 	return f.StuffedCount >= 16 &&
-		float64(f.StuffedCount)/float64(f.BlockSize) >= 1.0/2048.0
+		float64(f.StuffedCount)/float64(f.BlockSize) >= 1.0/2048.0 &&
+		StuffedRatio(f) >= stuffedRatioMin
 }
 
 // IsJPEGStart 判断这一簇里有没有出现 JPEG 起始标记 SOI。

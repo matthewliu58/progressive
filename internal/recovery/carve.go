@@ -6,7 +6,6 @@ import (
 	"strings"
 
 	"progrescarve/internal/feature"
-	"progrescarve/internal/feature/jpeg"
 
 	fsinit "progrescarve/internal/fs/finit"
 )
@@ -24,15 +23,16 @@ import (
 
 // indexEdgeScore 只用索引里的特征给「a → b」这一对打分，不回读磁盘。
 //
-// 两边都得在扫描时命中过（也就是都是 JPEG 候选）才打得出分；有一边查不到就不打 ——
-// 不值得为了记一条日志把整簇再读一遍，扫描阶段已经读过一次了。
+// 两边都得在扫描时命中过才打得出分；有一边查不到就不打 —— 不值得为了记一条日志
+// 把整簇再读一遍，扫描阶段已经读过一次了。
+// 打分函数由 Hit 自己按格式分发，这里不用知道簇里装的是 JPEG 还是 MP4。
 func indexEdgeScore(stats *ScanStats, a, b uint32) (float64, bool) {
 	ha, okA := stats.HitAt(a)
 	hb, okB := stats.HitAt(b)
-	if !okA || !okB || ha.JPEG == nil || hb.JPEG == nil {
+	if !okA || !okB {
 		return 0, false
 	}
-	return jpeg.ScoreNext(*ha.JPEG, *hb.JPEG), true
+	return ha.ScoreNext(hb), true
 }
 
 // logEdgeScore 把「prevCID → nextCID」这一对的关系分打出来。
@@ -57,51 +57,69 @@ func logEdgeScore(logger *slog.Logger, path string, prevCID, nextCID uint32,
 	logger.Debug("cluster edge score", append(attrs, extra...)...)
 }
 
-// expectsJPEG 按扩展名判断这个文件「按理说」该是 JPEG。
+// expectedFormat 按扩展名猜这个文件「按理说」该是什么格式，返回对应的「文件头」分类。
+// 猜不出（我们不认识的格式）返回 KindNone。
 //
-// 只有先有预期，才敢因为内容不像就判失败：卷上还有 mp4、txt 这些我们不认识的格式，
-// 它们的第一簇当然不是 JPEG 头，不能一并否掉。
-func expectsJPEG(path string) bool {
+// 只有先有预期，才敢因为内容不像就判失败：卷上还有 txt、pdf 这些我们没做特征识别的
+// 格式，它们的第一簇当然对不上任何格式头，不能一并否掉。
+func expectedFormat(path string) feature.Kind {
 	lower := strings.ToLower(path)
 	for _, ext := range []string{".jpg", ".jpeg", ".jpe"} {
 		if strings.HasSuffix(lower, ext) {
-			return true
+			return feature.KindJPEGHeader
 		}
 	}
-	return false
+	for _, ext := range []string{".mp4", ".mov", ".m4v", ".m4a"} {
+		if strings.HasSuffix(lower, ext) {
+			return feature.KindMP4Header
+		}
+	}
+	return feature.KindNone
 }
 
 // checkFirstCluster 校验目录项给的第一簇是不是真属于这个文件。
 //
 // 目录项只给簇号，不给内容：删除之后那一簇很可能被别的数据写过（位图上仍是空闲，
-// 因为新文件后来也被删了）。扫过、且名字说是 JPEG、但簇首不是 SOI —— 那就是被污染了，
-// 往下写只会产出一个打不开的假阳性。
+// 因为新文件后来也被删了）。判据是「扫出来的格式跟名字对得上，且文件头标记就在簇首」——
+// 对不上就是被污染了，往下写只会产出一个打不开的假阳性。
 //
 // 只在有证据时才下判断，其余情况一律放过：
 //   - 没扫描索引：不判；
-//   - 这一簇没被扫到（超出扫描范围，或位图不是空闲）：不知道，不判；
-//   - 名字看不出是 JPEG：没有预期，不判。
+//   - 这一簇没被扫到（超出扫描范围，或被活文件占着）：不知道，不判；
+//   - 名字看不出格式（我们不认识的格式）：没有预期，不判。
 func checkFirstCluster(stats *ScanStats, state map[uint32]ClusterState,
 	entry fsinit.FileEntryItem, cid uint32) error {
-	if stats == nil || !expectsJPEG(entry.Path) {
+	want := expectedFormat(entry.Path)
+	if stats == nil || want == feature.KindNone {
 		return nil
 	}
-	if cid > stats.ScannedUpTo || state[cid] != ClusterFree {
+	if cid > stats.ScannedUpTo || state[cid] == ClusterUsed {
 		return nil
 	}
 	h, ok := stats.HitAt(cid)
-	if ok && h.IsJPEGHead() {
+	if ok && h.Kind == want && h.IsFileHead() {
 		return nil
 	}
 
-	fc := &FirstClusterError{Cluster: cid, Kind: feature.KindNone, SOIOffset: -1, Path: entry.Path}
+	fc := &FirstClusterError{Cluster: cid, Kind: feature.KindNone, HeadOffset: -1, Path: entry.Path}
 	if ok {
 		fc.Kind = h.Kind
-		if h.JPEG != nil {
-			fc.SOIOffset = h.JPEG.SOIOffset
-		}
+		fc.HeadOffset = headOffset(h)
 	}
 	return fc
+}
+
+// headOffset 是「文件头标记在簇内哪一字节」的统一问法：JPEG 看 SOI、MP4 看 ftyp，
+// 各格式字段名不同，但报错和日志只需要这一个答案。
+func headOffset(h feature.Hit) int {
+	switch {
+	case h.JPEG != nil:
+		return h.JPEG.SOIOffset
+	case h.MP4 != nil:
+		return h.MP4.FTYPOffset
+	default:
+		return -1
+	}
 }
 
 const (
@@ -130,21 +148,23 @@ const (
 // 又容易错。last 是链上最后一个有指针可达的簇，want 是还差的字节数。
 func carveChain(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
 	claims map[uint32]string, last uint32, want uint64, clusterSize uint64,
-	logger *slog.Logger, path string) []uint32 {
+	format feature.Kind, logger *slog.Logger, path string) []uint32 {
 	if stats == nil || clusterSize == 0 || want == 0 {
 		return nil
 	}
-	return carveFollow(parser, stats, state, claims, last, want, clusterSize, logger, path)
+	return carveFollow(parser, stats, state, claims, last, want, clusterSize,
+		format, logger, path)
 }
 
 // carveFollow 从 last 往后一簇一簇地把后续碎片接出来。want 是还差多少字节。
+// format 是这个文件的目标格式（由第一簇定），用来引导挑选；KindNone 表示不知道。
 // logger / path 只用来把每一步的关系分打出来（见 logEdgeScore）。
 func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
 	claims map[uint32]string, last uint32, want uint64, clusterSize uint64,
-	logger *slog.Logger, path string) []uint32 {
+	format feature.Kind, logger *slog.Logger, path string) []uint32 {
 
-	// 前一簇的特征是打分基准：后面每一簇都要跟它比。
-	prev := featureOf(parser, stats, last)
+	// 前一簇的命中信息是打分基准：后面每一簇都要跟它比。
+	prev := hitOf(parser, stats, last)
 	if prev == nil {
 		return nil // 连前一段长什么样都不知道，没有打分依据，别瞎猜
 	}
@@ -160,10 +180,11 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 		// 所以最后一簇只要求：紧挨着、能拿。多出来的 slack 解码器一律无视，
 		// 少了它文件就是残的。
 		if want <= clusterSize {
-			if tail := last + 1; tailOK(stats, state, claims, used, tail) {
+			// 最后一簇：不假定它紧挨着（可能隔着别的文件），也不要求它认得出格式。
+			if tail, ok := pickTail(stats, state, claims, used, last, format); ok {
 				guessed = append(guessed, tail)
-				// 最后一簇通常统计上不像 JPEG，索引里没有它，多半打不出关系分；
-				// 那就只记下接了谁，事后能对着簇号回查。
+				// 最后一簇多半统计上认不出格式，关系分打不出来；那就只记下接了谁，
+				// 事后能对着簇号回查。
 				if score, ok := indexEdgeScore(stats, last, tail); ok {
 					logEdgeScore(logger, path, last, tail, score, "tail")
 				} else {
@@ -173,7 +194,7 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 			break
 		}
 
-		next, ok := pickNext(stats, state, claims, used, prev, last, logger, path)
+		next, ok := pickNext(stats, state, claims, used, prev, last, format, logger, path)
 		if !ok {
 			break // 窗口里没有能接的，到此为止
 		}
@@ -181,8 +202,9 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 		used[next] = true
 		guessed = append(guessed, next)
 
-		// 这一簇里有 EOI：文件数据流到此结束，后面全是 padding，不用再找。
-		if h, hit := stats.HitAt(next); hit && h.IsJPEGEnd() {
+		// 这一簇里有结束标记（JPEG 的 EOI）：数据流到此为止，后面全是空隙，不用再找。
+		// MP4 没有结束标记，它只能靠下面那条 DataLength 喂没喂饱来判断。
+		if h, hit := stats.HitAt(next); hit && h.IsFileEnd() {
 			break
 		}
 
@@ -191,7 +213,7 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 		}
 		want -= clusterSize
 
-		last, prev = next, featureOf(parser, stats, next)
+		last, prev = next, hitOf(parser, stats, next)
 		if prev == nil {
 			break
 		}
@@ -201,30 +223,35 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 
 // pickNext 挑 last 的下一簇。
 //
-// 先试连续的 last+1：exFAT 分配器默认连续分配，这一种的命中率远高于任何打分，
-// 而且它是「分配器的行为」，不是统计巧合。连续的那簇不能用，才去候选里按分挑。
+// 三条路，依次退让：
+//  1. 连续的 last+1（严格）：分配器的默认行为，比任何打分可靠；
+//  2. 窗口里按分挑（严格）：要求候选在索引里、且判成同一格式的后续碎片；
+//  3. 格式引导的兜底：见 pickLoose。这一条只给「没有可判定局部规律」的格式开
+//     （现在只有 MP4）—— 视频的 mdat 逐簇认不出来，只能靠分配规律往前接。
+//
+// want 是这个文件该是什么格式（由第一簇定，见 planChain）；KindNone 表示不知道。
 func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
-	used map[uint32]bool, prev *jpeg.Feature, last uint32,
+	used map[uint32]bool, prev *feature.Hit, last uint32, want feature.Kind,
 	logger *slog.Logger, path string) (uint32, bool) {
 
-	// 连续的那簇直接收，不看分（分配器的默认行为比打分可靠），但分照样记一笔：
+	// 一、连续的那簇直接收，不看分（分配器的默认行为比打分可靠），但分照样记一笔：
 	// 事后要能看出「这一段虽然按连续收了，其实关系分很低」，那才是真断了的地方。
-	if cont := last + 1; usable(stats, state, claims, used, cont) {
+	if cont := last + 1; usable(stats, state, claims, used, cont, want) {
 		if score, ok := indexEdgeScore(stats, last, cont); ok {
 			logEdgeScore(logger, path, last, cont, score, "contiguous")
 		}
 		return cont, true
 	}
 
-	// 候选到扫描索引里找，不去遍历簇号空间：后者绝大多数簇号压根不是候选，空转。
+	// 二、候选到扫描索引里找，不去遍历簇号空间：后者绝大多数簇号压根不是候选，空转。
 	//
-	// Payloads 是扫描时判定为「JPEG 后续碎片」的簇，按簇号升序排好，二分定位到
-	// last+1，往后取、直到超出 carveWindow 的跨度为止。
+	// FragmentClusters 是扫描时判定为「后续碎片」的簇（各格式合在一起），按簇号升序
+	// 排好，二分定位到 last+1，往后取、直到超出 carveWindow 的跨度为止。
 	//
 	// 只看后面，这是实测换来的：理论上分配器会回头填空隙（后续碎片簇号更小），
 	// 但放开双向之后立刻出现了 461 → 143 这种倒着接的错拼 —— 而那个错误候选的
 	// 分数（6.25）还比正确的（5.75）高。收益远抵不上代价，先卡死前向。
-	payloads := stats.Payloads()
+	payloads := stats.FragmentClusters()
 	pos, _ := slices.BinarySearch(payloads, last+1)
 	limit := last + carveWindow
 
@@ -244,12 +271,14 @@ func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 		if cid > limit {
 			break
 		}
-		if !usable(stats, state, claims, used, cid) {
+		if !usable(stats, state, claims, used, cid, want) {
 			continue
 		}
 		h, _ := stats.HitAt(cid)
 		considered++
-		score := jpeg.ScoreNext(*prev, *h.JPEG)
+		// 打分由 Hit 自己按格式分发：JPEG 走 jpeg.ScoreNext，MP4 走 mp4.ScoreNext。
+		// 格式对不上时给 0，等于否决（低于 carveMinScore）。
+		score := prev.ScoreNext(h)
 		if score < carveMinScore {
 			vetoed++ // 分数不够：否决，接着看更远的那个
 			continue
@@ -261,14 +290,81 @@ func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 	// 正经做法是遍历成树：每一步保留若干个候选（beam），走不通再回溯到上一个分叉。
 	// 难点在剪枝：候选一多就爆炸，得拿解码器之类的硬判据来砍，光靠打分砍不动 ——
 	// 实测错候选能比正确候选高出 0.5 分，这分辨力撑不起搜索。
-	if best == 0 {
+	if best != 0 {
+		logEdgeScore(logger, path, last, best, bestScore, "window",
+			slog.Int("candidates", considered),
+			slog.Int("vetoed", vetoed),
+			slog.Uint64("dist", uint64(best-last)))
+		return best, true
+	}
+
+	// 三、兜底：格式引导，不要求候选自证格式。
+	return pickLoose(stats, state, claims, used, last, want, logger, path)
+}
+
+// pickTail 往前搜第一个「不是别的东西」的簇，用来接最后一簇。
+//
+// 最后一簇有两个特点，都得照顾到：
+//  1. 认不出格式：它通常只有开头一小截是真实数据，后面全是空隙，统计上不像任何
+//     格式（严格路径会把它否掉）。所以这里不要求它自证身份。
+//  2. 不一定紧挨着：文件被别的数据插断时，最后一簇可能隔了好几个簇号。
+//     实测踩过 —— 链是 …317 → 320，而 318、319 属于别的文件，假定 last+1
+//     就把尾巴丢了（8 簇只拼出 7 簇）。
+//
+// 排除的是「它其实是别的东西」：被活文件占着、已被认领、扫过且判成别种格式、
+// 扫过且是某个文件的头。没扫过的簇不作数（连反证都拿不到）。
+func pickTail(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
+	used map[uint32]bool, last uint32, want feature.Kind) (uint32, bool) {
+	limit := last + carveWindow
+	for cid := last + 1; cid <= limit; cid++ {
+		if !takeable(state, claims, used, cid) {
+			continue
+		}
+		if cid > stats.ScannedUpTo {
+			break
+		}
+		if h, ok := stats.HitAt(cid); ok {
+			if h.IsFileStart() {
+				continue
+			}
+			if want != feature.KindNone && h.Kind != feature.KindNone && h.Kind != want {
+				continue
+			}
+		}
+		return cid, true
+	}
+	return 0, false
+}
+
+// pickLoose 是给「逐簇认不出来」的格式留的兜底。
+//
+// 为什么需要它：视频（MP4 的 mdat）在字节层面没有任何局部规律可依 —— 不像 JPEG
+// 那样有「每个 FF 后面必须补 00」这种在每个位置都成立的判据。实测下来，逐簇识别
+// 视频只有两种结果：判据一松，全卡 99% 的簇都成 MP4；一紧，一个都认不出来。
+// 中间没有稳定区间，说明这件事孤立地看一簇本就不可判定。
+//
+// 所以这里换依据：不要求候选自证是视频，只排除「它其实是别的东西」——
+//   - 被活文件占着：不是；
+//   - 已被别的文件认领：不是；
+//   - 扫过、且索引里判成别种格式的碎片：不是；
+//   - 扫过、且索引里说它是某个文件的头：不是。
+//
+// 剩下的（扫过但什么都不像）就是要的 —— 视频的 mdat 正是这个样子。
+//
+// 只给这类格式开，别扩散：JPEG 有强判据，认不出来就是真不是，兜底只会接错。
+func pickLoose(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
+	used map[uint32]bool, last uint32, want feature.Kind,
+	logger *slog.Logger, path string) (uint32, bool) {
+	if want != feature.KindMP4Payload {
 		return 0, false
 	}
-	logEdgeScore(logger, path, last, best, bestScore, "window",
-		slog.Int("candidates", considered),
-		slog.Int("vetoed", vetoed),
-		slog.Uint64("dist", uint64(best-last)))
-	return best, true
+
+	cid, ok := pickTail(stats, state, claims, used, last, want)
+	if ok {
+		logEdgeScore(logger, path, last, cid, 0, "loose",
+			slog.Uint64("dist", uint64(cid-last)))
+	}
+	return cid, ok
 }
 
 // takeable 判断 cid 在物理上能不能拿：没用过、位图没被占、没被别的文件认领。
@@ -283,41 +379,45 @@ func takeable(state map[uint32]ClusterState, claims map[uint32]string,
 	return !taken
 }
 
-// usable 判断 cid 能不能当「中间簇」候选：能拿之外还要求它像 JPEG。
-// 中间簇整簇都是熵编码数据，不像就说明它不属于这个文件 —— 这条对中间簇是硬道理。
+// usable 判断 cid 能不能当「中间簇」候选（严格）：能拿之外还要求它在索引里、
+// 且判成目标格式的后续碎片。中间簇整簇都是编码后的数据，判成别的东西就说明它不属于
+// 这个文件 —— 这条对中间簇是硬道理。
+//
+// want 是目标格式（由第一簇定）；KindNone 表示不知道，那就任何格式的碎片都收。
 func usable(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
-	used map[uint32]bool, cid uint32) bool {
+	used map[uint32]bool, cid uint32, want feature.Kind) bool {
 	if !takeable(state, claims, used, cid) {
 		return false
 	}
 	h, ok := stats.HitAt(cid)
-	return ok && h.IsJPEG() && !h.IsJPEGStart()
-}
-
-// tailOK 判断 cid 能不能当「最后一簇」：能拿就行，不要求像 JPEG。
-// 唯一的额外否决是里面别有 SOI —— 那是另一个文件的开头，不是我们的尾巴。
-func tailOK(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
-	used map[uint32]bool, cid uint32) bool {
-	if !takeable(state, claims, used, cid) {
+	if !ok {
+		return false // 索引里没有（没扫到或什么都不像）：交给兜底路径决定
+	}
+	if h.IsFileStart() {
 		return false
 	}
-	if h, ok := stats.HitAt(cid); ok && h.IsJPEGStart() {
-		return false
+	if want == feature.KindNone {
+		return h.IsPayload()
 	}
-	return true
+	return h.Kind == want
 }
 
-// featureOf 取一簇的 JPEG 特征：索引里有就直接拿，没有就现读现扫。
+// hitOf 取一簇的命中详情：索引里有就直接拿，没有就现读现分一遍。
 // 索引里没有通常是「这一簇没被扫到」（比如它不在空闲簇里），现读一次成本可接受 ——
 // 每个断链文件最多多读这一簇。
-func featureOf(parser fsinit.FileSystemParser, stats *ScanStats, cid uint32) *jpeg.Feature {
-	if h, ok := stats.HitAt(cid); ok && h.JPEG != nil {
-		return h.JPEG
+//
+// 返回的是整条 Hit 而不是某个格式的特征：打分由 Hit 自己按格式分发，
+// 这函数不用知道簇里装的是什么。
+func hitOf(parser fsinit.FileSystemParser, stats *ScanStats, cid uint32) *feature.Hit {
+	if h, ok := stats.HitAt(cid); ok {
+		return &h
 	}
 	data, err := parser.ReadCluster(cid)
 	if err != nil {
 		return nil
 	}
-	f := jpeg.Scan(data)
-	return &f
+	// 认不出格式的也照返回：兜底路径要的就是「扫过但什么都不像」的簇
+	// （视频的 mdat 正是这样），由调用方决定怎么处理。
+	h := feature.Classify(cid, data)
+	return &h
 }
