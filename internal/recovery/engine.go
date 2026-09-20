@@ -127,6 +127,17 @@ type RestoreResult struct {
 	Truncated bool              // true：只恢复了前半段
 	Stop      *OverwrittenError // 断在哪、被谁占了；非「被占」截断时为 nil
 	Short     *ShortChainError  // 链在长度前就断了时的详情；否则 nil
+
+	// CarvedClusters 是猜出来的簇号，原样带出来给调用方。
+	//
+	// 带上它是为了校验失败时能按簇号把认领撤回来：猜的簇在认领表里占着位，
+	// 后来证明猜错了却还占着不放，别的文件就永远用不上这些簇 —— 一次猜错
+	// 会连带压掉别人的机会。
+	CarvedClusters []uint32
+
+	// Verify 非 nil：猜出来的那部分没过校验，已经被丢弃，dst 里只剩元数据
+	// 确认的前半段。见 writePlan 里的回退。CarvedClusters 是当时猜的那几簇。
+	Verify *VerifyError
 }
 
 // BuildClusterState 遍历所有未删除的条目，沿簇链走一遍，得到「簇号 → 占用状态」表：
@@ -257,6 +268,35 @@ type chainPlan struct {
 	// guessed 是断链之后靠内容特征猜回来的簇（见 carve.go）：顺序不是元数据说的，
 	// 是猜的。写盘时单独记一笔，别和 chain 里那些有指针可达的簇混为一谈。
 	guessed []uint32
+
+	// format 是这份文件的格式（由第一簇定，认不出再按扩展名猜），有两处用：
+	// 挑后续碎片时当目标（见 carve.go），写盘后按它校验（见 verify.go）。
+	// KindNone = 不知道，那就不校验。
+	format feature.Kind
+}
+
+// classifyFormat 由第一簇和扩展名定下这份文件「后续碎片」的目标格式
+// （jpeg_payload / mp4_payload）。第一簇被扫成碎片类别或干脆不像时，不能信 HitAt，
+// 必须回退扩展名兜底：否则就像那个 Alipay 截图，第一簇被误扫成 payload，
+// FragmentKind 落到 None，.jpg 静默跳过了校验。
+//
+// 两处共用同一份：planChain 末尾的续接分支（断链要按格式挑碎片），以及
+// NoFatChain 分支（连续自增拼出来的文件也要拿到格式去校验）。
+func classifyFormat(stats *ScanStats, entry fsinit.FileEntryItem) feature.Kind {
+	format := feature.KindNone
+	if stats != nil {
+		if h, ok := stats.HitAt(entry.FirstCluster); ok {
+			if fk := h.Kind.FragmentKind(); fk != feature.KindNone {
+				format = fk
+			}
+		}
+	}
+	if format == feature.KindNone {
+		if k := expectedFormat(entry.Path); k != feature.KindNone {
+			format = k.FragmentKind()
+		}
+	}
+	return format
 }
 
 // planChain 沿链走一遍并校验。两种「走不到头」都只截断、不报错 —— 断点之前的数据是完好的，
@@ -327,6 +367,16 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 
 		plan.chain = append(plan.chain, cid)
 
+		// 第一簇就定下格式（命中头类别最好，命中非头按扩展名兜底）：FAT 链与
+		// NoFatChain 都走这条公共路径，统一在这里拿一次，不用四处各写一遍。
+		if len(plan.chain) == 1 {
+			plan.format = classifyFormat(stats, entry)
+			if logger != nil {
+				logger.Info("classifyFormat", slog.String("entry", entry.Path),
+					slog.Any("format", plan.format), slog.Bool("has_stats", stats != nil))
+			}
+		}
+
 		if need > 0 {
 			if need <= clusterSize {
 				need = 0
@@ -392,14 +442,9 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 		// 就地续接：指针到这儿就断了，后半段只能按内容特征去找。last / want 这两个
 		// 数只有这一步最清楚，在这里把 list 组装好交给 writePlan，不在外面重算一遍。
 		if len(plan.chain) > 0 {
-			// 目标格式由第一簇定（认不出就按扩展名猜）：后续簇按这个格式去挑，
+			// 格式首簇已定（plan.format，公共路径统一取过）：后续簇按这个格式去挑，
 			// 不再要求每一簇自己证明身份 —— 视频的 mdat 做不到。
-			format := feature.KindNone
-			if h, ok := stats.HitAt(entry.FirstCluster); ok {
-				format = h.Kind.FragmentKind()
-			} else if k := expectedFormat(entry.Path); k != feature.KindNone {
-				format = k.FragmentKind()
-			}
+			format := plan.format // 写盘后按它校验：猜的部分要过解码器才算数
 			plan.guessed = carveChain(parser, stats, state, claims,
 				plan.chain[len(plan.chain)-1], need, clusterSize, format, logger, entry.Path)
 			if claims != nil {
@@ -444,6 +489,10 @@ func RestoreFile(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, sta
 // 写出顺序是 chain ++ guessed：先是有指针可达的簇，再是猜出来的簇。DataLength 的
 // 截断一视同仁 —— 猜出来的最后一簇也按剩余长度切，多出来的字节是下一个文件的。
 //
+// 有猜出来的簇时分两段写：先 chain，后 guessed。写完过一遍解码校验（见 verify.go），
+// 不过就把文件截断回 chain 的长度 —— 猜的数据全在尾部，截掉即可，源盘不用读第二遍。
+// 猜的那几簇随结果带出去，由调用方从认领表里撤掉。
+//
 // logger 可为 nil（不打印）。簇号清单打 Debug：每个文件一条、簇数可能上千，
 // 走 Info 会把终端刷掉；文件日志是 Debug 级，全程留着事后翻。
 func writePlan(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, plan chainPlan, dst string, logger *slog.Logger) (RestoreResult, error) {
@@ -473,44 +522,133 @@ func writePlan(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, plan 
 			slog.Any("clusters", all))
 	}
 
+	// TODO(空目录): 目录层级是靠建文件的父目录顺带还原的，已删除的空目录不会被建出来。
+	// 要还原完整目录树得另外遍历目录条目逐个 MkdirAll，前提是 FileEntryItem 暴露 IsDir，暂缓。
+
 	// 父目录按需建出来；dst 是设备节点时 filepath.Dir 返回已存在的目录，MkdirAll 是空操作。
 	if dir := filepath.Dir(dst); dir != "" && dir != "." {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			return res, fmt.Errorf("create dir %s: %w", dir, err)
 		}
 	}
-
-	// TODO(空目录): 目录层级是靠建文件的父目录顺带还原的，已删除的空目录不会被建出来。
-	// 要还原完整目录树得另外遍历目录条目逐个 MkdirAll，前提是 FileEntryItem 暴露 IsDir，暂缓。
-
 	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return res, fmt.Errorf("open dst %s: %w", dst, err)
 	}
 	defer out.Close()
 
-	left := entry.DataLength
-	for _, cid := range all {
-		chunk, err := parser.ReadCluster(cid)
-		if err != nil {
-			return res, fmt.Errorf("read cluster %d: %w", cid, err)
+	// 分两段写：先 chain，再 guessed。
+	//
+	// 之所以不合成一段，是为了校验失败时能直接 Truncate 回到 chain 的长度 ——
+	// 猜的字节就在文件末尾，截掉就行，不必把 chain 从源盘再读一遍。
+	// left 是 DataLength 还剩多少，两段接着往下扣，最后一簇的截断才连贯。
+	chainBytes, left, err := writeClustersTo(parser, out, plan.chain, entry.DataLength)
+	if err != nil {
+		return res, err
+	}
+	res.Bytes = chainBytes
+
+	guessedBytes, _, err := writeClustersTo(parser, out, plan.guessed, left)
+	if err != nil {
+		return res, err
+	}
+	res.Bytes += guessedBytes
+
+	// 写出来的整份必须过校验 —— 不只猜的那段。前面那些判据（内容特征、相邻打分、
+	// 簇号距离）全都只能说「没发现不对」，只有解码器能说「这份是通的」。
+	//
+	// 即便是纯 FAT 链（没有猜的簇）也要验：FAT 表项可能残留，指向的簇早被覆盖成
+	// 别的文件的数据，凭指针拼出来不等于内容对。
+	//
+	// 过不了就丢掉猜的那一段（有的话）：留着猜错的字节，等于给用户一份体积合法、
+	// 名字也对、打开却是坏的文件 —— 比少给几簇难发现得多。回退之后 res.Carved 归零，
+	// 猜的那几簇由调用方从认领表里撤掉（见 RestoreAllDeleted）。纯链验证失败时没有
+	// 可丢的簇，原地保留并标 Verify，交给调用方记录。
+	if plan.format == feature.KindNone {
+		// 格式不明，无从校验，照留。两种来历：
+		//   - 正常：txt / pdf 这类我们根本没做特征识别的格式，第一簇对不上任何头；
+		//   - 异常：第一簇被误分类（或 HitAt 命中了非头类别），连扩展名兜底都被短路，
+		//     明明 .jpg 却落到这里 —— 这种要提一嗓子，否则就像你那个 Alipay 截图一样
+		//     悄无声息地跳过了校验。
+		if logger != nil {
+			if exp := expectedFormat(entry.Path); exp != feature.KindNone {
+				logger.Warn("format undetermined, skipping verify despite known extension",
+					slog.String("entry", entry.Path),
+					slog.String("expected_by_ext", exp.String()))
+			} else {
+				logger.Debug("format undetermined, skipping verify",
+					slog.String("entry", entry.Path))
+			}
+		}
+		return res, nil // 格式不明，无从校验，猜的这部分照留
+	}
+	if verr := verifyOutput(dst, plan.format); verr != nil {
+		if logger != nil {
+			logger.Error("carved clusters rejected by decoder",
+				slog.String("entry", entry.Path),
+				slog.String("dst", dst),
+				slog.Int("carved_clusters", len(plan.guessed)),
+				slog.String("format", plan.format.String()),
+				slog.Any("reason", verr))
+		}
+		res.Verify = &VerifyError{
+			Path:   entry.Path,
+			Format: plan.format,
+			Carved: len(plan.guessed),
+			Err:    verr,
+		}
+		res.CarvedClusters = plan.guessed
+
+		// 截断回第一段的长度就够了：猜的数据全在文件尾部，不用重读源盘。
+		if err := out.Truncate(int64(chainBytes)); err != nil {
+			return res, fmt.Errorf("truncate dst %s back to %d bytes: %w", dst, chainBytes, err)
+		}
+		res.Bytes, res.Clusters, res.Carved = chainBytes, len(plan.chain), 0
+		res.Truncated = true // 猜的全扔了，剩的就是「只有前半段」
+	} else {
+		// 猜的部分解码器认了：这是真正的好消息 —— 说明这套「格式引导 + 连续假设」
+		// 在这份文件上确实对，可以按完整恢复放心计。失败的那条在 writePlan 里
+		// 直接打 Error（carved clusters rejected by decoder，含原因），释放动作
+		// 由 RestoreAllDeleted 补记 Warn（carved clusters released back to pool）。
+		if logger != nil {
+			logger.Info("carved clusters verified",
+				slog.String("entry", entry.Path),
+				slog.String("dst", dst),
+				slog.Int("carved_clusters", len(plan.guessed)),
+				slog.String("format", plan.format.String()))
+		}
+	}
+	return res, nil
+}
+
+// writeClustersTo 把 clusters 里的数据顺序写进已打开的 out，返回写出的字节数，
+// 以及 DataLength 还剩多少没写。
+//
+// left 由调用方接着上一段传下来：文件分两段写（见 writePlan），而最后一簇的截断
+// 要按整份 DataLength 算，两段各算各的会切错。left == 0 表示长度未知（目录、
+// DataLength 为 0），那就整簇照写不截断。
+func writeClustersTo(parser fsinit.FileSystemParser, out *os.File, clusters []uint32, left uint64) (written, remain uint64, err error) {
+	for _, cid := range clusters {
+		chunk, rerr := parser.ReadCluster(cid)
+		if rerr != nil {
+			return written, left, fmt.Errorf("read cluster %d: %w", cid, rerr)
 		}
 		if left > 0 && uint64(len(chunk)) > left {
 			chunk = chunk[:left] // 最后一簇通常只用到一部分
 		}
-		n, err := out.Write(chunk)
-		if err != nil {
-			return res, fmt.Errorf("write dst %s: %w", dst, err)
+		n, werr := out.Write(chunk)
+		if werr != nil {
+			return written, left, fmt.Errorf("write dst %s: %w", out.Name(), werr)
 		}
 		if n != len(chunk) {
-			return res, fmt.Errorf("write dst %s: short write %d/%d", dst, n, len(chunk))
+			return written, left, fmt.Errorf("write dst %s: short write %d/%d", out.Name(), n, len(chunk))
 		}
-		res.Bytes += uint64(len(chunk))
+		written += uint64(len(chunk))
 		if left > 0 {
 			left -= uint64(len(chunk))
 		}
 	}
-	return res, nil
+	return written, left, nil
 }
 
 // isSystemJunk 判断条目是不是文件系统自己的杂物：.Spotlight-V100 / .fseventsd / .Trashes /
@@ -552,6 +690,7 @@ type RestoreSummary struct {
 	Full       int    // 其中整份恢复的
 	Partial    int    // 其中只恢复了前半段的
 	Carved     int    // 其中靠猜补了后半段的：数据是蒙的，必须人工确认过才能用
+	CarvedBad  int    // 其中校验没过的：猜的部分已丢弃、簇已释放，输出只剩前半段
 	Failed     int    // 一个字节都没拿到的
 	Bytes      uint64 // 写出数据的总字节数
 
@@ -663,6 +802,20 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 			continue
 		}
 
+		if res.Verify != nil {
+			// 猜错了：把认领撤回来。
+			//
+			// 认领表是全局的，猜的簇占着位却不放，别的文件就再也用不上它们 ——
+			// 一次猜错会连带压掉别人的机会。chain 那部分的认领保留：那些簇有
+			// 指针可达，确实属于这份文件，只是后半段猜砸了。
+			for _, cid := range res.CarvedClusters {
+				delete(claims, cid)
+			}
+			sum.CarvedBad++
+			logVerifyFailed(logger, pre, e.Path, dst, res)
+			// 不 continue：猜的部分已经丢弃、Truncated 已置上，接着按 partial 处理。
+		}
+
 		sum.Restored++
 		sum.Bytes += res.Bytes
 		if res.Carved > 0 {
@@ -702,6 +855,31 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 		logger.Error("no deleted file restored", attrs...)
 	}
 	return sum, nil
+}
+
+// logVerifyFailed 记一条「猜的部分没过校验，已丢弃并释放认领」的后续动作。
+//
+// 验证失败那一刻的 Error（含解码器给的原因）由 writePlan 直接打；这里是在
+// 调用方真正把认领撤掉之后补记「释放了多少簇」—— 跟那条 Error 不重复：
+// 一条说「为什么拒」，一条说「拒了之后放回去几簇」。
+func logVerifyFailed(logger *slog.Logger, pre, path, dst string, res RestoreResult) {
+	if logger == nil {
+		return
+	}
+	attrs := []any{
+		slog.String("pre", pre),
+		slog.String("entry", path),
+		slog.String("dst", dst),
+		slog.Uint64("bytes", res.Bytes),
+		slog.Int("clusters", res.Clusters),
+		slog.Int("released_clusters", len(res.CarvedClusters)),
+	}
+	if v := res.Verify; v != nil {
+		attrs = append(attrs,
+			slog.String("format", v.Format.String()),
+			slog.Int("rejected_clusters", v.Carved))
+	}
+	logger.Warn("carved clusters released back to pool", attrs...)
 }
 
 // logRestorePartial 记一条「只恢复了前半段」的告警：残缺文件的大小是合法的，光看 dst 分不出来。
@@ -857,6 +1035,7 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 		slog.Int("full", sum.Full),
 		slog.Int("partial", sum.Partial),
 		slog.Int("carved", sum.Carved),
+		slog.Int("carved_bad", sum.CarvedBad),
 		slog.Int("failed", sum.Failed),
 		slog.Uint64("bytes", sum.Bytes),
 		slog.Int("mp4_probes", sum.MP4Probes),
