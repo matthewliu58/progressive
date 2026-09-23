@@ -18,6 +18,7 @@ import (
 	"os"
 	"path/filepath"
 	"progrescarve/internal/feature"
+	"progrescarve/internal/feature/mp4"
 	"progrescarve/internal/fs"
 	fsinit "progrescarve/internal/fs/finit"
 	"strings"
@@ -445,8 +446,27 @@ func planChain(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem, state
 			// 格式首簇已定（plan.format，公共路径统一取过）：后续簇按这个格式去挑，
 			// 不再要求每一簇自己证明身份 —— 视频的 mdat 做不到。
 			format := plan.format // 写盘后按它校验：猜的部分要过解码器才算数
+
+			// 探 moov 不以「判定这是 MP4」为前提 —— 恰恰相反：MP4 的媒体数据
+			// 逐簇认不出来（见 feature.Classify 里那段说明），我们没有这个能力，
+			// 拿判定出来的格式当门坎只会漏：第一簇被覆盖时它常被判成别的格式，
+			// 于是 format 已经是别的值了，一个真 MP4 就这么被挡在门外。
+			//
+			// 所以判据反过来：谁都去探一次，探到 moov 本身就是硬证据 ——
+			// moov 是 MP4 独有的结构，找着它就同时证明了「这是 MP4」和
+			// 「地图能用」，不需要任何前置判定。探不到就当没这回事。
+			var idx *mp4.Index
+			if p := probeMoov(parser, entry); p.Found() {
+				idx = loadMoovIndex(parser, clusterSize, p)
+				logMoovMap(logger, entry.Path, p, idx)
+			}
+
+			// 下一个待拼的簇落在文件第几字节：已拼的是 DataLength-need 那么多。
+			// 考试要把「地图上的文件偏移」换算成「簇内偏移」，缺了它无从考起。
+			baseOff := entry.DataLength - need
 			plan.guessed = carveChain(parser, stats, state, claims,
-				plan.chain[len(plan.chain)-1], need, clusterSize, format, logger, entry.Path)
+				plan.chain[len(plan.chain)-1], need, clusterSize, format, logger, entry.Path,
+				idx, baseOff)
 			if claims != nil {
 				// 猜出来的簇也要认领，否则两个残缺文件会把同一簇各自写进自己的输出。
 				// TODO(回溯)：猜错时要能把认领撤回来，现在是一次认到底，没有回头路。

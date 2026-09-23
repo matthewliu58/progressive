@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"progrescarve/internal/feature"
+	"progrescarve/internal/feature/mp4"
 
 	fsinit "progrescarve/internal/fs/finit"
 )
@@ -139,6 +140,12 @@ const (
 	// carveMaxClusters 是单个文件最多猜多少簇。防 DataLength 被写坏（比如 0xFFFFFFFF）
 	// 时一路猜到盘尾。
 	carveMaxClusters = 4096
+
+	// mapMaxProbe 是按 moov 地图考试时最多读几个候选簇。
+	//
+	// 考一次就得把整簇读回来（几百 KB），顺着读太多既慢又多半说明这张地图用不上
+	// （比如 NAL 长度前缀的假设不对，那谁都考不过）—— 到量就交回老路子，别烧 I/O。
+	mapMaxProbe = 32
 )
 
 // carveChain 在链的断点上就地续接后续碎片，返回猜出来的簇号（按接上的顺序）。
@@ -148,20 +155,26 @@ const (
 // 又容易错。last 是链上最后一个有指针可达的簇，want 是还差的字节数。
 func carveChain(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
 	claims map[uint32]string, last uint32, want uint64, clusterSize uint64,
-	format feature.Kind, logger *slog.Logger, path string) []uint32 {
+	format feature.Kind, logger *slog.Logger, path string,
+	idx *mp4.Index, baseOff uint64) []uint32 {
 	if stats == nil || clusterSize == 0 || want == 0 {
 		return nil
 	}
 	return carveFollow(parser, stats, state, claims, last, want, clusterSize,
-		format, logger, path)
+		format, logger, path, idx, baseOff)
 }
 
 // carveFollow 从 last 往后一簇一簇地把后续碎片接出来。want 是还差多少字节。
 // format 是这个文件的目标格式（由第一簇定），用来引导挑选；KindNone 表示不知道。
 // logger / path 只用来把每一步的关系分打出来（见 logEdgeScore）。
+//
+// idx 是这份文件的 moov 地图（没有就传 nil）：有它的时候下一簇是「考」出来的，
+// 不是「猜」出来的，见 pickByMoov。baseOff 是下一个待拼的簇落在文件的第几字节
+// —— 考试要用它把「地图上的文件偏移」换成「簇内偏移」。
 func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
 	claims map[uint32]string, last uint32, want uint64, clusterSize uint64,
-	format feature.Kind, logger *slog.Logger, path string) []uint32 {
+	format feature.Kind, logger *slog.Logger, path string,
+	idx *mp4.Index, baseOff uint64) []uint32 {
 
 	// 前一簇的命中信息是打分基准：后面每一簇都要跟它比。
 	prev := hitOf(parser, stats, last)
@@ -171,6 +184,7 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 
 	var guessed []uint32
 	used := map[uint32]bool{last: true}
+	fileOff := baseOff // 下一个待拼的簇，在文件里从第几字节开始
 
 	for want > 0 && len(guessed) < carveMaxClusters {
 		// 还差不到一簇的量 —— 这就是文件的最后一簇。它通常只有开头一小截是图像
@@ -194,7 +208,8 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 			break
 		}
 
-		next, ok := pickNext(stats, state, claims, used, prev, last, format, logger, path)
+		next, ok := pickNext(parser, stats, state, claims, used, prev, last, format,
+			logger, path, idx, fileOff, clusterSize)
 		if !ok {
 			break // 窗口里没有能接的，到此为止
 		}
@@ -212,6 +227,7 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 			break // 这一簇已经把 DataLength 喂饱
 		}
 		want -= clusterSize
+		fileOff += clusterSize // 这一簇占了文件里这一段，下一个待拼的从它后面开始
 
 		last, prev = next, hitOf(parser, stats, next)
 		if prev == nil {
@@ -223,6 +239,11 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 
 // pickNext 挑 last 的下一簇。
 //
+// 有 moov 地图（idx 非 nil 且可用）时先按地图考：那是「第 N 个采样在第几字节」
+// 这种硬事实，比簇号距离和打分可靠得多 —— 两份文件交错存放时，last+1 常常是
+// 别人的一簇，只有考得过才敢收。考不出结果再退回下面三条路，别因为有地图
+// 反而什么都不敢拼。
+//
 // 三条路，依次退让：
 //  1. 连续的 last+1（严格）：分配器的默认行为，比任何打分可靠；
 //  2. 窗口里按分挑（严格）：要求候选在索引里、且判成同一格式的后续碎片；
@@ -230,9 +251,25 @@ func carveFollow(parser fsinit.FileSystemParser, stats *ScanStats, state map[uin
 //     （现在只有 MP4）—— 视频的 mdat 逐簇认不出来，只能靠分配规律往前接。
 //
 // want 是这个文件该是什么格式（由第一簇定，见 planChain）；KindNone 表示不知道。
-func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
-	used map[uint32]bool, prev *feature.Hit, last uint32, want feature.Kind,
-	logger *slog.Logger, path string) (uint32, bool) {
+func pickNext(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
+	claims map[uint32]string, used map[uint32]bool, prev *feature.Hit, last uint32,
+	want feature.Kind, logger *slog.Logger, path string,
+	idx *mp4.Index, fileOff, clusterSize uint64) (uint32, bool) {
+
+	// 〇、有地图就按地图考：这是唯一的硬判据，优先于「连续默认收」那一条。
+	if idx != nil && idx.Usable() {
+		if cid, ok := pickByMoov(parser, stats, state, claims, used, last, want,
+			idx, fileOff, clusterSize, logger, path); ok {
+			return cid, true
+		}
+		if logger != nil {
+			logger.Debug("moov map selected nothing, falling back",
+				slog.String("entry", path),
+				slog.Uint64("last", uint64(last)),
+				slog.Uint64("file_off", fileOff),
+				slog.Int("checks_in_range", idx.ChecksIn(fileOff, clusterSize)))
+		}
+	}
 
 	// 一、连续的那簇直接收，不看分（分配器的默认行为比打分可靠），但分照样记一笔：
 	// 事后要能看出「这一段虽然按连续收了，其实关系分很低」，那才是真断了的地方。
@@ -300,6 +337,82 @@ func pickNext(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 
 	// 三、兜底：格式引导，不要求候选自证格式。
 	return pickLoose(stats, state, claims, used, last, want, logger, path)
+}
+
+// pickByMoov 按 moov 地图挑下一簇：假设候选簇就是文件里 [fileOff, fileOff+簇大小)
+// 这一段，考它内部每个采样起点是不是真的是个 NAL 的开始（见 mp4.Index.Match）。
+//
+// 为什么这能分开交错存放的两份文件：地图是这一份文件自己的，别的文件的数据在
+// 本文件的采样起点上对不出 NAL 头。归属是「内容在它该在的位置上自不自洽」判的，
+// 不是「谁离得近」判的 —— 交错时 last+1 常常正是别人的一簇，只有考得过才敢收。
+//
+// 候选由近及远：分配器一路往后写，最近的那个最可能是真的；考试只否决、不排序
+// （排序是掷骰子，见 pickNext 里的说明）。考不过就看下一个。
+func pickByMoov(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
+	claims map[uint32]string, used map[uint32]bool, last uint32, want feature.Kind,
+	idx *mp4.Index, fileOff, clusterSize uint64, logger *slog.Logger, path string) (uint32, bool) {
+
+	limit := last + carveWindow
+	probed := 0
+	for cid := last + 1; cid <= limit; cid++ {
+		if !takeable(state, claims, used, cid) {
+			continue
+		}
+		if cid > stats.ScannedUpTo {
+			break
+		}
+		// 排除「它其实是别的东西」：这两条跟 pickTail 一致，跟地图无关 ——
+		// 地图只回答「像不像这一段」，回答不了「是不是别人的头」。
+		if h, ok := stats.HitAt(cid); ok {
+			if h.IsFileStart() {
+				continue // 它是某个文件的头，不可能同时是中间这一段
+			}
+			if want != feature.KindNone && h.Kind != feature.KindNone && h.Kind != want {
+				continue // 索引里判成别种格式的碎片
+			}
+		}
+		if probed >= mapMaxProbe {
+			break // 读够多了还没考上：多半是这张地图用不上，交回老路子
+		}
+		data, err := parser.ReadCluster(cid)
+		if err != nil {
+			continue
+		}
+		probed++
+
+		checked, passed := idx.Match(data, fileOff)
+		switch {
+		case checked == 0:
+			// 这一段地图上没考点（整簇都落在一个大采样内部）：没有信息，
+			// 不能拿来否决，收下并记一笔 —— 事后能看出哪些簇是盲收的。
+			logMoovCheck(logger, path, cid, fileOff, 0, 0, "no_checks")
+			return cid, true
+		case passed == checked:
+			logMoovCheck(logger, path, cid, fileOff, checked, passed, "pass")
+			return cid, true
+		default:
+			logMoovCheck(logger, path, cid, fileOff, checked, passed, "reject")
+		}
+	}
+	return 0, false
+}
+
+// logMoovCheck 记一次「拿候选簇去对 moov 地图」的结果。
+//
+// 级别 Debug：每个候选都打。要看的是 reject 那几条的 checks/passed —— 真簇该全过，
+// 别人家的簇通常一个都过不了；这个比例直接反映这张地图的分辨力够不够。
+func logMoovCheck(logger *slog.Logger, path string, cid uint32, fileOff uint64,
+	checked, passed int, verdict string) {
+	if logger == nil {
+		return
+	}
+	logger.Debug("cluster checked against moov map",
+		slog.String("entry", path),
+		slog.Uint64("cid", uint64(cid)),
+		slog.Uint64("file_off", fileOff),
+		slog.Int("checks", checked),
+		slog.Int("passed", passed),
+		slog.String("verdict", verdict))
 }
 
 // pickTail 往前搜第一个「不是别的东西」的簇，用来接最后一簇。

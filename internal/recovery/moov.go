@@ -130,3 +130,79 @@ func logMoovProbe(logger *slog.Logger, pre, path string, p moovProbe) {
 		slog.String("codec", p.Codec),
 		slog.Int("probed", p.ClustersProbed))
 }
+
+// moovMaxClusters 是读 moov 时最多顺着往下读几簇。
+//
+// moov 大的时候会跨好几簇（几百 KB 到几 MB 都有），但它内部是连续的，顺着读几簇
+// 就够；读这么多还凑不齐，说明那个 size 字段本身不可信。
+const moovMaxClusters = 32
+
+// loadMoovIndex 把探测指出的那个 moov 整段读出来，解析成「偏移 → 采样」地图
+// （见 mp4.ParseIndex）。拿到了它，后续簇是「考」出来的，不是猜出来的。
+//
+// 读不全、解析出错一律返回 nil：没有地图只是退回原来的拼法，而一张半截的地图
+// 会去否决正确的簇 —— 后者比没有地图糟得多。
+func loadMoovIndex(parser fsinit.FileSystemParser, clusterSize uint64, p moovProbe) *mp4.Index {
+	if !p.Found() || clusterSize == 0 {
+		return nil
+	}
+	first, err := parser.ReadCluster(p.MOOVCluster)
+	if err != nil {
+		return nil
+	}
+	size, err := mp4.MoovSize(first, p.MOOVOffset)
+	if err != nil {
+		return nil
+	}
+	need := uint64(p.MOOVOffset) + size
+	if need <= uint64(len(first)) {
+		// moov 整个就在这一簇里，不用再往下读。
+		idx, err := mp4.ParseIndex(first[p.MOOVOffset:need])
+		if err != nil {
+			return nil
+		}
+		return &idx
+	}
+
+	buf := make([]byte, 0, need)
+	buf = append(buf, first...)
+	for cid := p.MOOVCluster + 1; uint64(len(buf)) < need; cid++ {
+		if uint64(len(buf))/clusterSize >= moovMaxClusters {
+			return nil
+		}
+		next, err := parser.ReadCluster(cid)
+		if err != nil {
+			return nil
+		}
+		buf = append(buf, next...)
+	}
+	idx, err := mp4.ParseIndex(buf[p.MOOVOffset:need])
+	if err != nil {
+		return nil
+	}
+	return &idx
+}
+
+// logMoovMap 记一条「这份文件有没有拿到 moov 地图、地图上多少个考点」。
+//
+// 级别 Info：这是「后面靠算还是靠猜」的分岔点，用上地图的文件各一条 ——
+// 跑完能直接统计出多少文件从猜升级成了算。
+func logMoovMap(logger *slog.Logger, path string, p moovProbe, idx *mp4.Index) {
+	if logger == nil {
+		return
+	}
+	attrs := []any{
+		slog.String("entry", path),
+		slog.Uint64("moov_cluster", uint64(p.MOOVCluster)),
+		slog.Int("moov_offset", p.MOOVOffset),
+		slog.String("codec", p.Codec),
+		slog.Bool("usable", idx != nil && idx.Usable()),
+	}
+	if idx != nil {
+		attrs = append(attrs,
+			slog.Int("samples", len(idx.Samples)),
+			slog.Int("nal_size", idx.NALSize),
+			slog.Bool("hevc", idx.HEVC))
+	}
+	logger.Info("mp4 moov map", attrs...)
+}
