@@ -52,6 +52,23 @@ type Index struct {
 // Usable 表示这份地图能不能拿来考试（有考点才有意义）。
 func (idx Index) Usable() bool { return len(idx.Samples) > 0 }
 
+// CanNALExam 表示这份地图能不能按「采样起点是 NAL 头」来考试。
+//
+// 只有把采样封装成 NAL 的编码才行（H.264 / HEVC 这一族）：它们的每个采样开头是
+// 「长度前缀 + NAL 头」，偏移算出来之后可以逐点验证。而 Apple ProRes、DNxHD
+// 这些（MOV 里常见）不是这么封装的，采样开头另有格式 —— 对它们按 NAL 考，
+// 正确的簇会一道都过不了，于是全被否掉：比没有地图还糟。
+//
+// 用白名单而不是黑名单：漏认一个新编码的代价只是「这份不用地图」，而误认一个
+// 的代价是把所有正确的簇全否掉。两害相权取前者。
+func (idx Index) CanNALExam() bool {
+	switch idx.Codec {
+	case "avc1", "avc3", "hvc1", "hev1":
+		return true
+	}
+	return false
+}
+
 // ParseIndex 从一段完整的 moov（含 box 头）解析出采样地图。
 //
 // 只认 vide 轨；拿不到采样（没有视频轨、表不全、count 大得离谱）就返回错误 ——

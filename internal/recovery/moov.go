@@ -3,6 +3,7 @@ package recovery
 import (
 	"log/slog"
 
+	"progrescarve/internal/feature/mov"
 	"progrescarve/internal/feature/mp4"
 
 	fsinit "progrescarve/internal/fs/finit"
@@ -66,6 +67,11 @@ func probeMoov(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem) moovP
 		p.HeadHasMOOV = mp4.HasIndex(f)
 		p.HeadHasMDAT = f.MDATOffset >= 0
 		p.Codec = mp4.CodecTag(data)
+		if p.Codec == "" {
+			// MOV 里常见的 Apple 编码（ProRes / DNxHD…）mp4 那边认不出来，
+			// 由 mov 包补认：说出「这是 ProRes」才解释得通为什么这份文件用不了地图。
+			p.Codec = mov.CodecTag(data)
+		}
 		if p.HeadHasMOOV {
 			p.MOOVCluster, p.MOOVOffset = entry.FirstCluster, f.MOOVOffset
 			return p
@@ -101,6 +107,9 @@ func probeMoov(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem) moovP
 			p.MOOVCluster, p.MOOVOffset = cid, f.MOOVOffset
 			if p.Codec == "" {
 				p.Codec = mp4.CodecTag(data)
+			}
+			if p.Codec == "" {
+				p.Codec = mov.CodecTag(data)
 			}
 			break
 		}

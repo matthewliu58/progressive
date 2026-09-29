@@ -256,8 +256,12 @@ func pickNext(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32
 	want feature.Kind, logger *slog.Logger, path string,
 	idx *mp4.Index, fileOff, clusterSize uint64) (uint32, bool) {
 
-	// 〇、有地图就按地图考：这是唯一的硬判据，优先于「连续默认收」那一条。
-	if idx != nil && idx.Usable() {
+	// 〇、有地图、且这份文件的编码能按 NAL 考的时候才考：这是唯一的硬判据，
+	// 优先于「连续默认收」那一条。
+	//
+	// 不能考的必须放开（Apple ProRes / DNxHD 这类不是 NAL 封装的编码，
+	// 见 mp4.Index.CanNALExam）：拿不适用的判据去否掉正确的簇，比没有地图还糟。
+	if idx != nil && idx.Usable() && idx.CanNALExam() {
 		if cid, ok := pickByMoov(parser, stats, state, claims, used, last, want,
 			idx, fileOff, clusterSize, logger, path); ok {
 			return cid, true
@@ -351,6 +355,12 @@ func pickNext(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32
 func pickByMoov(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint32]ClusterState,
 	claims map[uint32]string, used map[uint32]bool, last uint32, want feature.Kind,
 	idx *mp4.Index, fileOff, clusterSize uint64, logger *slog.Logger, path string) (uint32, bool) {
+
+	// 给不出判据的地图不能拿来否决候选（Apple ProRes / DNxHD 这类编码，
+	// 它们不是 NAL 封装的，考一道错一道）。宁可不考，退回调用方的老路子。
+	if idx == nil || !idx.Usable() || !idx.CanNALExam() {
+		return 0, false
+	}
 
 	limit := last + carveWindow
 	probed := 0
