@@ -70,9 +70,19 @@ func expectedFormat(path string) feature.Kind {
 			return feature.KindJPEGHeader
 		}
 	}
-	for _, ext := range []string{".mp4", ".mov", ".m4v", ".m4a"} {
+	for _, ext := range []string{".mp4", ".m4v", ".m4a"} {
 		if strings.HasSuffix(lower, ext) {
 			return feature.KindMP4Header
+		}
+	}
+	for _, ext := range []string{".mov"} {
+		if strings.HasSuffix(lower, ext) {
+			return feature.KindMOVHeader
+		}
+	}
+	for _, ext := range []string{".png"} {
+		if strings.HasSuffix(lower, ext) {
+			return feature.KindPNGHeader
 		}
 	}
 	return feature.KindNone
@@ -118,6 +128,16 @@ func headOffset(h feature.Hit) int {
 		return h.JPEG.SOIOffset
 	case h.MP4 != nil:
 		return h.MP4.FTYPOffset
+	case h.PNG != nil:
+		// PNG 签名固定在簇首第 0 字节，文件头标记不会落在别处。
+		return 0
+	case h.MOV != nil:
+		// MOV 文件头在簇首：现代是 ftyp（FTYPOffset==0），老式 QuickTime 没有
+		// ftyp、直接从 moov 起（MOOVOffset==0）。两者都在第 0 字节。
+		if h.MOV.FTYPOffset == 0 {
+			return 0
+		}
+		return h.MOV.MOOVOffset
 	default:
 		return -1
 	}
@@ -461,9 +481,9 @@ func pickTail(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 
 // pickLoose 是给「逐簇认不出来」的格式留的兜底。
 //
-// 为什么需要它：视频（MP4 的 mdat）在字节层面没有任何局部规律可依 —— 不像 JPEG
-// 那样有「每个 FF 后面必须补 00」这种在每个位置都成立的判据。实测下来，逐簇识别
-// 视频只有两种结果：判据一松，全卡 99% 的簇都成 MP4；一紧，一个都认不出来。
+// 为什么需要它：视频（MP4 / MOV 的 mdat）在字节层面没有任何局部规律可依 —— 不像
+// JPEG 那样有「每个 FF 后面必须补 00」这种在每个位置都成立的判据。实测下来，逐簇
+// 识别视频只有两种结果：判据一松，全卡 99% 的簇都成 MP4；一紧，一个都认不出来。
 // 中间没有稳定区间，说明这件事孤立地看一簇本就不可判定。
 //
 // 所以这里换依据：不要求候选自证是视频，只排除「它其实是别的东西」——
@@ -474,11 +494,11 @@ func pickTail(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 //
 // 剩下的（扫过但什么都不像）就是要的 —— 视频的 mdat 正是这个样子。
 //
-// 只给这类格式开，别扩散：JPEG 有强判据，认不出来就是真不是，兜底只会接错。
+// 只给这类格式开，别扩散：JPEG / PNG 有强判据，认不出来就是真不是，兜底只会接错。
 func pickLoose(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
 	used map[uint32]bool, last uint32, want feature.Kind,
 	logger *slog.Logger, path string) (uint32, bool) {
-	if want != feature.KindMP4Payload {
+	if want != feature.KindMP4Payload && want != feature.KindMOVPayload {
 		return 0, false
 	}
 

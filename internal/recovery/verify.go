@@ -6,7 +6,9 @@ import (
 
 	"progrescarve/internal/feature"
 	"progrescarve/internal/feature/jpeg"
+	"progrescarve/internal/feature/mov"
 	"progrescarve/internal/feature/mp4"
+	"progrescarve/internal/feature/png"
 )
 
 // VerifyError 表示拼出来的这份文件过不了校验：猜的那几簇大概接错了。
@@ -50,6 +52,13 @@ func verifyOutput(dst string, format feature.Kind) error {
 		return jpeg.CheckDecode(f, fi.Size())
 	case feature.KindMP4Header, feature.KindMP4Payload:
 		return mp4.CheckStructure(f)
+	case feature.KindPNGHeader, feature.KindPNGPayload:
+		return png.CheckDecode(f, fi.Size())
+	case feature.KindMOVHeader, feature.KindMOVPayload:
+		// MOV 用 mov.CheckStructure：它容忍「没有 ftyp、直接从 moov 起」的传统
+		// QuickTime 布局，以及 wide/free/skip 这类 MOV 特有的顶层 atom。用
+		// mp4.CheckStructure 会把这些好文件误杀。
+		return mov.CheckStructure(f)
 	default:
 		return nil
 	}

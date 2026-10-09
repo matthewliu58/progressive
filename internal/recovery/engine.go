@@ -784,9 +784,10 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 			slog.Uint64("size", e.DataLength),
 			slog.Int("first_cluster", int(e.FirstCluster)))
 
-		// MP4 先探一下索引（moov）在不在、在第几簇。现在只探不打 ——
+		// MP4 / MOV 先探一下索引（moov）在不在、在第几簇。现在只探不打 ——
 		// 命中率够高的话，后续簇就能按 moov 的 chunk 偏移表算出来，不用猜。
-		if expectedFormat(e.Path) == feature.KindMP4Header {
+		// MOV 与 MP4 共用 ISO 容器，moov 地图是同一套，直接复用这条探测。
+		if k := expectedFormat(e.Path); k == feature.KindMP4Header || k == feature.KindMOVHeader {
 			sum.MP4Probes++
 			p := probeMoov(parser, e)
 			logMoovProbe(logger, pre, e.Path, p)

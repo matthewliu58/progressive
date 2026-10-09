@@ -2,7 +2,9 @@ package feature
 
 import (
 	"progrescarve/internal/feature/jpeg"
+	"progrescarve/internal/feature/mov"
 	"progrescarve/internal/feature/mp4"
+	"progrescarve/internal/feature/png"
 )
 
 // Kind 表示一簇数据的内容类型。
@@ -21,11 +23,25 @@ const (
 	// KindJPEGPayload JPEG 的中间/后续碎片：只有统计特征像熵编码流，没有文件头。
 	KindJPEGPayload
 
-	// KindMP4Header MP4/MOV 文件的第一簇：开头是 box 结构，第二个盒子名是 ftyp。
+	// KindMP4Header MP4 文件的第一簇：开头是 box 结构，第二个盒子名是 ftyp。
 	KindMP4Header
 
 	// KindMP4Payload MP4 的媒体数据碎片：mdat 里的 H.264 NAL 流连得成串。
 	KindMP4Payload
+
+	// KindPNGHeader PNG 文件的第一簇，以 8 字节签名开头。
+	KindPNGHeader
+
+	// KindPNGPayload PNG 的中间/后续碎片：只有分块结构特征像 PNG，没有文件头。
+	KindPNGPayload
+
+	// KindMOVHeader QuickTime 文件的第一簇：开头是 ftyp（现代）或 moov（老式
+	// QuickTime，没有 ftyp）。MOV 与 MP4 共用 ISO 基媒体容器，特征数据复用
+	// mp4.Feature，只是把 Kind 分开（见 mov 包说明）。
+	KindMOVHeader
+
+	// KindMOVPayload MOV 的媒体数据碎片：mdat 里的采样流，跟 MP4 共用容器。
+	KindMOVPayload
 )
 
 // String 返回日志里用的名字。日志字段名靠它，别随意改。
@@ -39,6 +55,14 @@ func (k Kind) String() string {
 		return "mp4_header"
 	case KindMP4Payload:
 		return "mp4_payload"
+	case KindPNGHeader:
+		return "png_header"
+	case KindPNGPayload:
+		return "png_payload"
+	case KindMOVHeader:
+		return "mov_header"
+	case KindMOVPayload:
+		return "mov_payload"
 	default:
 		return "none"
 	}
@@ -59,6 +83,15 @@ type Hit struct {
 	//
 	// 各格式各带各的字段，别把它们的字段平铺到这里 —— 一份簇数据只属于一种格式。
 	MP4 *mp4.Feature
+
+	// PNG 的特征；不是 PNG 时这里是 nil。
+	PNG *png.Feature
+
+	// MOV 的特征；不是 MOV 时这里是 nil。
+	//
+	// 复用 mp4.Feature：MOV 与 MP4 是同一套 ISO 基媒体容器，盒子结构、moov 地图、
+	// 相邻打分全通用（见 mov 包说明），不必另存一份。
+	MOV *mp4.Feature
 }
 
 // IsJPEGStart 表示这一簇里出现过 JPEG 起始标记 SOI：它是某个 JPEG 的第一簇，
@@ -95,6 +128,10 @@ func (k Kind) FragmentKind() Kind {
 		return KindJPEGPayload
 	case KindMP4Header:
 		return KindMP4Payload
+	case KindPNGHeader:
+		return KindPNGPayload
+	case KindMOVHeader:
+		return KindMOVPayload
 	default:
 		return KindNone
 	}
@@ -110,6 +147,18 @@ func (h Hit) IsJPEG() bool {
 func (h Hit) IsMP4() bool {
 	return h.Kind == KindMP4Header ||
 		h.Kind == KindMP4Payload
+}
+
+// IsPNG 返回这一簇是不是 PNG 候选（头或后续碎片都算）。
+func (h Hit) IsPNG() bool {
+	return h.Kind == KindPNGHeader ||
+		h.Kind == KindPNGPayload
+}
+
+// IsMOV 返回这一簇是不是 MOV 候选（头或媒体数据碎片都算）。
+func (h Hit) IsMOV() bool {
+	return h.Kind == KindMOVHeader ||
+		h.Kind == KindMOVPayload
 }
 
 // IsMP4Start 表示这一簇里出现了 ftyp：MP4 的文件头标志。
@@ -128,23 +177,67 @@ func (h Hit) HasIndex() bool {
 	return h.MP4 != nil && mp4.HasIndex(*h.MP4)
 }
 
+// IsPNGStart 表示这一簇里出现了 PNG 文件头签名：它是某个 PNG 的第一簇，
+// 只能当链的起点，不能挂在别的碎片后面。
+func (h Hit) IsPNGStart() bool {
+	return h.PNG != nil && png.IsPNGStart(*h.PNG)
+}
+
+// IsPNGHead 表示这一簇就是某个 PNG 的第一簇：签名就在簇首（偏移 0）。
+//
+// 和 IsPNGStart 的区别同 JPEG：PNG 签名只可能出现在第 0 字节，所以两者在此等价。
+func (h Hit) IsPNGHead() bool {
+	return h.PNG != nil && png.IsPNGHead(*h.PNG)
+}
+
+// IsPNGEnd 表示这一簇里出现了 IEND：如果它确实属于某个 PNG，那它通常就是该文件的
+// 最后一簇，后面不能再接。
+func (h Hit) IsPNGEnd() bool {
+	return h.PNG != nil && png.IsPNGEnd(*h.PNG)
+}
+
+// IsMOVStart 表示这一簇里出现了 MOV 的文件头标记：ftyp（现代）或 moov 在簇首
+// （老式 QuickTime，没有 ftyp）。它是某个 MOV 的第一簇，只能当链的起点。
+func (h Hit) IsMOVStart() bool {
+	return h.MOV != nil && (mp4.IsMP4Start(*h.MOV) || h.MOV.MOOVOffset == 0)
+}
+
+// IsMOVHead 表示这一簇就是某个 MOV 的第一簇：文件头标记就在簇首（偏移 0）。
+//
+// 和 IsMOVStart 的区别同 JPEG：IsMOVStart 是「簇内出现过头标记」（ftyp 可能落在
+// 任意偏移），IsMOVHead 是「这一簇从文件头开始」。判断目录项给的第一簇对不对，
+// 要用后者 —— 一个 MOV 的第一簇，ftyp 或 moov 必然就在第 0 字节。
+//
+// 注意这里用 FTYPOffset==0 或 MOOVOffset==0 两种：老式 QuickTime 没有 ftyp、
+// 直接从 moov 起，FTYPOffset 是 -1，得看 MOOVOffset。
+func (h Hit) IsMOVHead() bool {
+	return h.MOV != nil && (h.MOV.FTYPOffset == 0 || h.MOV.MOOVOffset == 0)
+}
+
 // 下面这几个是「不关心具体格式」的问法。carve 一律用这些，别在里面按 Kind 分叉 ——
 // 加一种格式只需要在这里多接一行，搜索逻辑一行都不用动。
 
 // IsFileStart 表示这一簇里出现了某种格式的文件头标记。
-func (h Hit) IsFileStart() bool { return h.IsJPEGStart() || h.IsMP4Start() }
+func (h Hit) IsFileStart() bool {
+	return h.IsJPEGStart() || h.IsMP4Start() || h.IsPNGStart() || h.IsMOVStart()
+}
 
 // IsFileHead 表示这一簇是某个文件的第一簇（文件头标记就在簇首）。
-func (h Hit) IsFileHead() bool { return h.IsJPEGHead() || h.IsMP4Head() }
+func (h Hit) IsFileHead() bool {
+	return h.IsJPEGHead() || h.IsMP4Head() || h.IsPNGHead() || h.IsMOVHead()
+}
 
 // IsFileEnd 表示这一簇里出现了结束标记，文件数据流到此为止。
 //
-// 注意 MP4 没有结束标记：它只能靠目录项的 DataLength 判断喂没喂饱。
-func (h Hit) IsFileEnd() bool { return h.IsJPEGEnd() }
+// 注意 MP4 / MOV 没有结束标记：它们只能靠目录项的 DataLength 判断喂没喂饱。
+func (h Hit) IsFileEnd() bool { return h.IsJPEGEnd() || h.IsPNGEnd() }
 
 // IsPayload 表示这一簇是某种格式的「后续碎片」候选 —— 可以接在别人后面。
 func (h Hit) IsPayload() bool {
-	return h.Kind == KindJPEGPayload || h.Kind == KindMP4Payload
+	return h.Kind == KindJPEGPayload ||
+		h.Kind == KindMP4Payload ||
+		h.Kind == KindPNGPayload ||
+		h.Kind == KindMOVPayload
 }
 
 // ScoreNext 估计 next 紧跟在 h 后面的可能性，分发到各自格式的打分函数。
@@ -155,6 +248,11 @@ func (h Hit) ScoreNext(next Hit) float64 {
 		return jpeg.ScoreNext(*h.JPEG, *next.JPEG)
 	case h.MP4 != nil && next.MP4 != nil:
 		return mp4.ScoreNext(*h.MP4, *next.MP4)
+	case h.PNG != nil && next.PNG != nil:
+		return png.ScoreNext(*h.PNG, *next.PNG)
+	case h.MOV != nil && next.MOV != nil:
+		// MOV 复用 mp4.Feature 与 mp4.ScoreNext：容器是同一套，相邻判据通用。
+		return mp4.ScoreNext(*h.MOV, *next.MOV)
 	default:
 		return 0
 	}
@@ -180,12 +278,31 @@ func Classify(cluster uint32, data []byte) Hit {
 		return h
 	}
 
-	// MP4 头：ftyp 是硬标记，跟 JPEG 的头平级。
-	if mp4.IsMP4Header(data) {
+	// MP4 / MOV 头：都是 ISO 基媒体文件格式，盒子结构同一套。MOV 比 MP4 宽松 ——
+	// 老式 QuickTime 没有 ftyp、直接从 moov 开头，mp4.IsMP4Header 认不出，这里用
+	// mov.IsMOVHeader 兜底（它收 ftyp 或 moov 两种开头）。两者特征数据共用 mp4.Feature
+	// （见 mov 包说明），只把 Kind 分开：没有 ftyp（从 moov 起）或品牌是 qt  一族
+	// 归 MOV，其余（isom/mp42/M4V 等品牌）归 MP4。
+	if mov.IsMOVHeader(data) {
 		f := mp4.Scan(data)
 
-		h.Kind = KindMP4Header
-		h.MP4 = &f
+		if !mp4.IsMP4Header(data) || mov.Brand(data) == "mov" {
+			h.Kind = KindMOVHeader
+			h.MOV = &f
+		} else {
+			h.Kind = KindMP4Header
+			h.MP4 = &f
+		}
+
+		return h
+	}
+
+	// PNG 头：8 字节签名是硬标记，跟上面的头平级。
+	if png.IsPNGHeader(data) {
+		f := png.Scan(data)
+
+		h.Kind = KindPNGHeader
+		h.PNG = &f
 
 		return h
 	}
@@ -196,6 +313,18 @@ func Classify(cluster uint32, data []byte) Hit {
 	if jpeg.IsLikelyJPEG(f) {
 		h.Kind = KindJPEGPayload
 		h.JPEG = &f
+
+		return h
+	}
+
+	// PNG 的后续碎片：只能靠「从簇首开始就能顺着分块结构走通」来认。落在 IDAT
+	// 压缩流中间的大多数碎片这里会漏掉（见 png.IsLikelyPNG 的注释），它们真正的
+	// 身份靠「从文件头顺着走分块」+ verify.go 的真解码确认。
+	p := png.Scan(data)
+
+	if png.IsLikelyPNG(p) {
+		h.Kind = KindPNGPayload
+		h.PNG = &p
 
 		return h
 	}

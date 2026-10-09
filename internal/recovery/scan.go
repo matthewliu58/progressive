@@ -35,7 +35,12 @@ type ScanStats struct {
 
 // fragmentKinds 是「可以接在别人后面」的那些分类。文件头不在此列 ——
 // 它是某个文件的第一簇，只能当起点。
-var fragmentKinds = []feature.Kind{feature.KindJPEGPayload, feature.KindMP4Payload}
+var fragmentKinds = []feature.Kind{
+	feature.KindJPEGPayload,
+	feature.KindMP4Payload,
+	feature.KindPNGPayload,
+	feature.KindMOVPayload,
+}
 
 // FragmentClusters 返回所有格式的碎片候选簇号，按簇号升序合并好。
 //
@@ -64,12 +69,20 @@ var jpegKinds = []feature.Kind{feature.KindJPEGHeader, feature.KindJPEGPayload}
 // mp4Kinds 是日志里要报告的 MP4 分类。
 var mp4Kinds = []feature.Kind{feature.KindMP4Header, feature.KindMP4Payload}
 
+// pngKinds 是日志里要报告的 PNG 分类。
+var pngKinds = []feature.Kind{feature.KindPNGHeader, feature.KindPNGPayload}
+
+// movKinds 是日志里要报告的 MOV 分类。
+var movKinds = []feature.Kind{feature.KindMOVHeader, feature.KindMOVPayload}
+
 // hitAttrs 把各类命中数摊成日志字段。字段固定、零也照打，日志行可 diff。
 // 加格式时把它的分类加进 mp4Kinds 那样的清单里，这里不用动。
 func hitAttrs(hits map[feature.Kind][]uint32) []any {
-	kinds := make([]feature.Kind, 0, len(jpegKinds)+len(mp4Kinds))
+	kinds := make([]feature.Kind, 0, len(jpegKinds)+len(mp4Kinds)+len(pngKinds)+len(movKinds))
 	kinds = append(kinds, jpegKinds...)
 	kinds = append(kinds, mp4Kinds...)
+	kinds = append(kinds, pngKinds...)
+	kinds = append(kinds, movKinds...)
 
 	attrs := make([]any, 0, len(kinds))
 	for _, k := range kinds {
