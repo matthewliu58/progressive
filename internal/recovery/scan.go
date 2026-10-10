@@ -40,6 +40,7 @@ var fragmentKinds = []feature.Kind{
 	feature.KindMP4Payload,
 	feature.KindPNGPayload,
 	feature.KindMOVPayload,
+	feature.KindWAVPayload,
 }
 
 // FragmentClusters 返回所有格式的碎片候选簇号，按簇号升序合并好。
@@ -75,14 +76,18 @@ var pngKinds = []feature.Kind{feature.KindPNGHeader, feature.KindPNGPayload}
 // movKinds 是日志里要报告的 MOV 分类。
 var movKinds = []feature.Kind{feature.KindMOVHeader, feature.KindMOVPayload}
 
+// wavKinds 是日志里要报告的 WAV 分类。
+var wavKinds = []feature.Kind{feature.KindWAVHeader, feature.KindWAVPayload}
+
 // hitAttrs 把各类命中数摊成日志字段。字段固定、零也照打，日志行可 diff。
 // 加格式时把它的分类加进 mp4Kinds 那样的清单里，这里不用动。
 func hitAttrs(hits map[feature.Kind][]uint32) []any {
-	kinds := make([]feature.Kind, 0, len(jpegKinds)+len(mp4Kinds)+len(pngKinds)+len(movKinds))
+	kinds := make([]feature.Kind, 0, len(jpegKinds)+len(mp4Kinds)+len(pngKinds)+len(movKinds)+len(wavKinds))
 	kinds = append(kinds, jpegKinds...)
 	kinds = append(kinds, mp4Kinds...)
 	kinds = append(kinds, pngKinds...)
 	kinds = append(kinds, movKinds...)
+	kinds = append(kinds, wavKinds...)
 
 	attrs := make([]any, 0, len(kinds))
 	for _, k := range kinds {

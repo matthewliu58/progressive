@@ -85,6 +85,11 @@ func expectedFormat(path string) feature.Kind {
 			return feature.KindPNGHeader
 		}
 	}
+	for _, ext := range []string{".wav"} {
+		if strings.HasSuffix(lower, ext) {
+			return feature.KindWAVHeader
+		}
+	}
 	return feature.KindNone
 }
 
@@ -138,6 +143,9 @@ func headOffset(h feature.Hit) int {
 			return 0
 		}
 		return h.MOV.MOOVOffset
+	case h.WAV != nil:
+		// WAV 签名 "RIFF" + "WAVE" 固定在簇首第 0 字节。
+		return 0
 	default:
 		return -1
 	}
@@ -481,24 +489,26 @@ func pickTail(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 
 // pickLoose 是给「逐簇认不出来」的格式留的兜底。
 //
-// 为什么需要它：视频（MP4 / MOV 的 mdat）在字节层面没有任何局部规律可依 —— 不像
-// JPEG 那样有「每个 FF 后面必须补 00」这种在每个位置都成立的判据。实测下来，逐簇
-// 识别视频只有两种结果：判据一松，全卡 99% 的簇都成 MP4；一紧，一个都认不出来。
-// 中间没有稳定区间，说明这件事孤立地看一簇本就不可判定。
+// 为什么需要它：媒体数据（MP4 / MOV 的 mdat、WAV 的 data 块）在字节层面没有任何局部
+// 规律可依 —— 不像 JPEG 那样有「每个 FF 后面必须补 00」这种在每个位置都成立的判据。
+// 实测下来，逐簇识别视频只有两种结果：判据一松，全卡 99% 的簇都成 MP4；一紧，一个
+// 都认不出来。中间没有稳定区间，说明这件事孤立地看一簇本就不可判定。
 //
-// 所以这里换依据：不要求候选自证是视频，只排除「它其实是别的东西」——
+// 所以这里换依据：不要求候选自证是媒体数据，只排除「它其实是别的东西」——
 //   - 被活文件占着：不是；
 //   - 已被别的文件认领：不是；
 //   - 扫过、且索引里判成别种格式的碎片：不是；
 //   - 扫过、且索引里说它是某个文件的头：不是。
 //
-// 剩下的（扫过但什么都不像）就是要的 —— 视频的 mdat 正是这个样子。
+// 剩下的（扫过但什么都不像）就是要的 —— mdat / data 块正是这个样子。
 //
 // 只给这类格式开，别扩散：JPEG / PNG 有强判据，认不出来就是真不是，兜底只会接错。
 func pickLoose(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
 	used map[uint32]bool, last uint32, want feature.Kind,
 	logger *slog.Logger, path string) (uint32, bool) {
-	if want != feature.KindMP4Payload && want != feature.KindMOVPayload {
+	if want != feature.KindMP4Payload &&
+		want != feature.KindMOVPayload &&
+		want != feature.KindWAVPayload {
 		return 0, false
 	}
 

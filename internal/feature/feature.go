@@ -5,6 +5,7 @@ import (
 	"progrescarve/internal/feature/mov"
 	"progrescarve/internal/feature/mp4"
 	"progrescarve/internal/feature/png"
+	"progrescarve/internal/feature/wav"
 )
 
 // Kind 表示一簇数据的内容类型。
@@ -42,6 +43,12 @@ const (
 
 	// KindMOVPayload MOV 的媒体数据碎片：mdat 里的采样流，跟 MP4 共用容器。
 	KindMOVPayload
+
+	// KindWAVHeader WAV（RIFF）文件的第一簇，以 "RIFF" + "WAVE" 开头。
+	KindWAVHeader
+
+	// KindWAVPayload WAV 的中间/后续碎片：只有分块结构特征像 WAV，没有文件头。
+	KindWAVPayload
 )
 
 // String 返回日志里用的名字。日志字段名靠它，别随意改。
@@ -63,6 +70,10 @@ func (k Kind) String() string {
 		return "mov_header"
 	case KindMOVPayload:
 		return "mov_payload"
+	case KindWAVHeader:
+		return "wav_header"
+	case KindWAVPayload:
+		return "wav_payload"
 	default:
 		return "none"
 	}
@@ -92,6 +103,9 @@ type Hit struct {
 	// 复用 mp4.Feature：MOV 与 MP4 是同一套 ISO 基媒体容器，盒子结构、moov 地图、
 	// 相邻打分全通用（见 mov 包说明），不必另存一份。
 	MOV *mp4.Feature
+
+	// WAV 的特征；不是 WAV 时这里是 nil。
+	WAV *wav.Feature
 }
 
 // IsJPEGStart 表示这一簇里出现过 JPEG 起始标记 SOI：它是某个 JPEG 的第一簇，
@@ -132,6 +146,8 @@ func (k Kind) FragmentKind() Kind {
 		return KindPNGPayload
 	case KindMOVHeader:
 		return KindMOVPayload
+	case KindWAVHeader:
+		return KindWAVPayload
 	default:
 		return KindNone
 	}
@@ -159,6 +175,12 @@ func (h Hit) IsPNG() bool {
 func (h Hit) IsMOV() bool {
 	return h.Kind == KindMOVHeader ||
 		h.Kind == KindMOVPayload
+}
+
+// IsWAV 返回这一簇是不是 WAV 候选（头或后续碎片都算）。
+func (h Hit) IsWAV() bool {
+	return h.Kind == KindWAVHeader ||
+		h.Kind == KindWAVPayload
 }
 
 // IsMP4Start 表示这一簇里出现了 ftyp：MP4 的文件头标志。
@@ -214,22 +236,43 @@ func (h Hit) IsMOVHead() bool {
 	return h.MOV != nil && (h.MOV.FTYPOffset == 0 || h.MOV.MOOVOffset == 0)
 }
 
+// IsWAVStart 表示这一簇里出现了 WAV 文件头签名（"RIFF" + "WAVE"）：它是某个 WAV
+// 的第一簇，只能当链的起点，不能挂在别的碎片后面。
+func (h Hit) IsWAVStart() bool {
+	return h.WAV != nil && wav.IsWAVStart(*h.WAV)
+}
+
+// IsWAVHead 表示这一簇就是某个 WAV 的第一簇：签名就在簇首（偏移 0）。
+//
+// 和 IsWAVStart 的区别同 JPEG：WAV 签名只可能出现在第 0 字节，所以两者在此等价。
+func (h Hit) IsWAVHead() bool {
+	return h.WAV != nil && wav.IsWAVHead(*h.WAV)
+}
+
+// IsWAVEnd 表示这一簇是不是 WAV 的最后一簇。
+//
+// WAV 没有结束标记（不像 JPEG 的 EOI / PNG 的 IEND）："data" 块后面就是文件尾，靠
+// 目录项的 DataLength 判断喂没喂饱。所以恒为 false。
+func (h Hit) IsWAVEnd() bool {
+	return h.WAV != nil && wav.IsWAVEnd(*h.WAV)
+}
+
 // 下面这几个是「不关心具体格式」的问法。carve 一律用这些，别在里面按 Kind 分叉 ——
 // 加一种格式只需要在这里多接一行，搜索逻辑一行都不用动。
 
 // IsFileStart 表示这一簇里出现了某种格式的文件头标记。
 func (h Hit) IsFileStart() bool {
-	return h.IsJPEGStart() || h.IsMP4Start() || h.IsPNGStart() || h.IsMOVStart()
+	return h.IsJPEGStart() || h.IsMP4Start() || h.IsPNGStart() || h.IsMOVStart() || h.IsWAVStart()
 }
 
 // IsFileHead 表示这一簇是某个文件的第一簇（文件头标记就在簇首）。
 func (h Hit) IsFileHead() bool {
-	return h.IsJPEGHead() || h.IsMP4Head() || h.IsPNGHead() || h.IsMOVHead()
+	return h.IsJPEGHead() || h.IsMP4Head() || h.IsPNGHead() || h.IsMOVHead() || h.IsWAVHead()
 }
 
 // IsFileEnd 表示这一簇里出现了结束标记，文件数据流到此为止。
 //
-// 注意 MP4 / MOV 没有结束标记：它们只能靠目录项的 DataLength 判断喂没喂饱。
+// 注意 MP4 / MOV / WAV 没有结束标记：它们只能靠目录项的 DataLength 判断喂没喂饱。
 func (h Hit) IsFileEnd() bool { return h.IsJPEGEnd() || h.IsPNGEnd() }
 
 // IsPayload 表示这一簇是某种格式的「后续碎片」候选 —— 可以接在别人后面。
@@ -237,7 +280,8 @@ func (h Hit) IsPayload() bool {
 	return h.Kind == KindJPEGPayload ||
 		h.Kind == KindMP4Payload ||
 		h.Kind == KindPNGPayload ||
-		h.Kind == KindMOVPayload
+		h.Kind == KindMOVPayload ||
+		h.Kind == KindWAVPayload
 }
 
 // ScoreNext 估计 next 紧跟在 h 后面的可能性，分发到各自格式的打分函数。
@@ -253,6 +297,8 @@ func (h Hit) ScoreNext(next Hit) float64 {
 	case h.MOV != nil && next.MOV != nil:
 		// MOV 复用 mp4.Feature 与 mp4.ScoreNext：容器是同一套，相邻判据通用。
 		return mp4.ScoreNext(*h.MOV, *next.MOV)
+	case h.WAV != nil && next.WAV != nil:
+		return wav.ScoreNext(*h.WAV, *next.WAV)
 	default:
 		return 0
 	}
@@ -307,6 +353,17 @@ func Classify(cluster uint32, data []byte) Hit {
 		return h
 	}
 
+	// WAV 头："RIFF" + 长度 + "WAVE"，跟上面的头平级。靠偏移 8 的 "WAVE" 跟 AVI/WEBP
+	// 这类同样用 RIFF 的格式分开。
+	if wav.IsWAVHeader(data) {
+		f := wav.Scan(data)
+
+		h.Kind = KindWAVHeader
+		h.WAV = &f
+
+		return h
+	}
+
 	// 都不是头，再看统计特征：JPEG 看 FF 00（数量、密度、以及 FF 后面是不是都补了 00）。
 	f := jpeg.Scan(data)
 
@@ -325,6 +382,18 @@ func Classify(cluster uint32, data []byte) Hit {
 	if png.IsLikelyPNG(p) {
 		h.Kind = KindPNGPayload
 		h.PNG = &p
+
+		return h
+	}
+
+	// WAV 的后续碎片：和 PNG 同理，只能靠「从簇首开始就能顺着 RIFF chunk 走通」来认。
+	// 落在 "data" 块中间的采样流（PCM 就是近似随机的字节）孤立看认不出来，真正的
+	// 身份靠「从文件头顺着走分块」+ verify.go 的结构校验确认。
+	w := wav.Scan(data)
+
+	if wav.IsLikelyWAV(w) {
+		h.Kind = KindWAVPayload
+		h.WAV = &w
 
 		return h
 	}

@@ -9,6 +9,7 @@ import (
 	"progrescarve/internal/feature/mov"
 	"progrescarve/internal/feature/mp4"
 	"progrescarve/internal/feature/png"
+	"progrescarve/internal/feature/wav"
 )
 
 // VerifyError 表示拼出来的这份文件过不了校验：猜的那几簇大概接错了。
@@ -59,6 +60,10 @@ func verifyOutput(dst string, format feature.Kind) error {
 		// QuickTime 布局，以及 wide/free/skip 这类 MOV 特有的顶层 atom。用
 		// mp4.CheckStructure 会把这些好文件误杀。
 		return mov.CheckStructure(f)
+	case feature.KindWAVHeader, feature.KindWAVPayload:
+		// WAV 用 wav.CheckStructure：Go 标准库没有 WAV 解码器，而且雕刻要的只是
+		// 「RIFF/WAVE 结构通不通」—— 验头、验 fmt、chunk 走得通就够（见 wav 包）。
+		return wav.CheckStructure(f) // 单参数，与 mov.CheckStructure 一致
 	default:
 		return nil
 	}
