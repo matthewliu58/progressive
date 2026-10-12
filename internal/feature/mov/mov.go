@@ -87,8 +87,8 @@ func IsMOVHeader(data []byte) bool {
 // brands 是 ftyp 里常见的品牌字符串。MOV 通常是 'qt  '（后面两个空格），
 // MP4 是 isom / mp42 / M4V  这一族。
 //
-// 只用来在日志里说清这份文件是哪一族的：能不能考地图取决于编码，不取决于品牌，
-// 所以品牌不参与任何判断。
+// 只用来在日志里说清这份文件是哪一族的：能不能考地图取决于编码，不取决于品牌
+// （见 CanNALExam 和 nalCodecs）。
 var brands = []struct {
 	family string
 	tag    string
@@ -101,13 +101,37 @@ var brands = []struct {
 }
 
 // Brand 读出这份文件属于哪一族（"mov" / "mp4"），认不出返回空串。
+//
+// 读的是 ftyp 盒子里偏移量固定的 major brand —— 它就落在盒子头 8 字节之后，
+// 是规范指定的权威字段：文件自己声明「我是哪一族」。没有 ftyp 就没有品牌可言
+// （传统 QuickTime 直接从 moov 起，那种归 MOV 不靠品牌，见 Classify 里
+// 的 !mp4.IsMP4Header 分支）。
+//
+// 早先这里是在前 64KB 里子串搜索这张表，被两个问题打回来了：
+//   - 位置无关：只要那 4 个字节出现在任何地方（udta 元数据、甚至是 mdat 里的
+//     媒体数据）就算命中，于是兼容品牌里带 "qt  " 的 .mp4 会被判成 MOV；
+//   - 顺序依赖：命中即返回，文件里同时有 isom 和 qt  时，族由这张表的排列顺序
+//     决定，而不是文件自己声明的主品牌。
+//
+// 它本来只是「看着像」的猜测，却被 Classify 拿去决定 Kind，再被 recovery 的
+// checkFirstCluster 跟扩展名做精确相等比较 —— 一个粗糙的猜测最终成了整份文件被
+// 丢弃的理由。改成解析 major brand 之后，位置确定、语义确定，不再靠猜。
 func Brand(data []byte) string {
-	limit := len(data)
-	if limit > codecScanMax {
-		limit = codecScanMax
+	// 盒子头 8 字节 + major brand 4 字节。
+	if len(data) < boxHeader+4 {
+		return ""
 	}
+	if uint64(binary.BigEndian.Uint32(data)) < boxHeader {
+		return ""
+	}
+	// 没有 ftyp 就没有品牌可言：传统 QuickTime 直接从 moov 起，
+	// 那种归 MOV 走的不是品牌这条路。
+	if string(data[4:8]) != "ftyp" {
+		return ""
+	}
+	major := string(data[boxHeader : boxHeader+4])
 	for _, b := range brands {
-		if bytes.Index(data[:limit], []byte(b.tag)) >= 0 {
+		if b.tag == major {
 			return b.family
 		}
 	}

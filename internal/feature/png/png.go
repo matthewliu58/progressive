@@ -213,7 +213,7 @@ func Scan(data []byte) Feature {
 			// chunk 跨到下一簇：记下来这个未完成 chunk 的剩余字节。
 			f.OpenChunkType = typ
 			f.OpenChunkRemain = end - len(data)
-			if pos+12+length == len(data) {
+			if pos+8+length == len(data) {
 				f.TailState = TailInCRC // data 正好读完，crc 在下一簇
 			} else {
 				f.TailState = TailInData

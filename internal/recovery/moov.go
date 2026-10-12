@@ -79,6 +79,11 @@ func probeMoov(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem) moovP
 	}
 
 	// 二、文件尾：按 DataLength 推出最后一簇，从它往回看几簇。
+	//
+	// TODO: 手机视频的 moov 起点通常不簇对齐（ftyp+mdat 长度随机），
+	// 导致簇首是 mdat 尾数据，scanBoxes 从簇首 0 偏移解析必然失败。
+	// 当前实现依赖相机视频的 moov 簇对齐特性，对手机视频会静默退化到启发式。
+	// 修法：改为 bytes.Index(data, []byte("moov")) 全文搜索，再用 MoovSize 校验。
 	fileClusters := (entry.DataLength + clusterSize - 1) / clusterSize
 	if fileClusters == 0 {
 		return p
@@ -142,9 +147,17 @@ func logMoovProbe(logger *slog.Logger, pre, path string, p moovProbe) {
 
 // moovMaxClusters 是读 moov 时最多顺着往下读几簇。
 //
-// moov 大的时候会跨好几簇（几百 KB 到几 MB 都有），但它内部是连续的，顺着读几簇
+// moov 大的时候会跨好几簇（几百 KB 到几十 MB 都有），但它内部是连续的，顺着读几簇
 // 就够；读这么多还凑不齐，说明那个 size 字段本身不可信。
-const moovMaxClusters = 32
+// 上限按 index.go 的 maxMoovSize=32MB 动态计算：32MB / clusterSize。
+// 这样 32K 簇是 1024 簇，128K 簇是 256 簇，统一卡在 32MB 不会多读。
+func moovMaxClusters(clusterSize uint64) uint64 {
+	const maxBytes = 32 << 20 // 32MB，与 mp4.maxMoovSize 对齐
+	if clusterSize == 0 {
+		return 0
+	}
+	return maxBytes / clusterSize
+}
 
 // loadMoovIndex 把探测指出的那个 moov 整段读出来，解析成「偏移 → 采样」地图
 // （见 mp4.ParseIndex）。拿到了它，后续簇是「考」出来的，不是猜出来的。
@@ -175,8 +188,9 @@ func loadMoovIndex(parser fsinit.FileSystemParser, clusterSize uint64, p moovPro
 
 	buf := make([]byte, 0, need)
 	buf = append(buf, first...)
+	maxClusters := moovMaxClusters(clusterSize)
 	for cid := p.MOOVCluster + 1; uint64(len(buf)) < need; cid++ {
-		if uint64(len(buf))/clusterSize >= moovMaxClusters {
+		if uint64(len(buf))/clusterSize >= maxClusters {
 			return nil
 		}
 		next, err := parser.ReadCluster(cid)

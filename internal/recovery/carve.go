@@ -103,6 +103,10 @@ func expectedFormat(path string) feature.Kind {
 //   - 没扫描索引：不判；
 //   - 这一簇没被扫到（超出扫描范围，或被活文件占着）：不知道，不判；
 //   - 名字看不出格式（我们不认识的格式）：没有预期，不判。
+//
+// 匹配按「家族」算，不按 Kind 精确相等（见 feature.SameFamily）：MP4 与 MOV 是同一套
+// ISO 容器，族名认错只是分类上的差别，不该成为整份文件被丢弃的理由 —— 完好的头
+// 被判成隔壁族，数据照样在盘上、照样救得回来。
 func checkFirstCluster(stats *ScanStats, state map[uint32]ClusterState,
 	entry fsinit.FileEntryItem, cid uint32) error {
 	want := expectedFormat(entry.Path)
@@ -113,7 +117,7 @@ func checkFirstCluster(stats *ScanStats, state map[uint32]ClusterState,
 		return nil
 	}
 	h, ok := stats.HitAt(cid)
-	if ok && h.Kind == want && h.IsFileHead() {
+	if ok && feature.SameFamily(h.Kind, want) && h.IsFileHead() {
 		return nil
 	}
 
@@ -392,6 +396,7 @@ func pickByMoov(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint
 
 	limit := last + carveWindow
 	probed := 0
+	var firstNoChecks uint32 // 第一个无考点候选，作为备选
 	for cid := last + 1; cid <= limit; cid++ {
 		if !takeable(state, claims, used, cid) {
 			continue
@@ -422,15 +427,25 @@ func pickByMoov(parser fsinit.FileSystemParser, stats *ScanStats, state map[uint
 		switch {
 		case checked == 0:
 			// 这一段地图上没考点（整簇都落在一个大采样内部）：没有信息，
-			// 不能拿来否决，收下并记一笔 —— 事后能看出哪些簇是盲收的。
+			// 不能拿来否决，但也别急着收 —— 交错存放时 last+1 常常是别人的簇。
+			// 先记下，继续往后找有考点且通过的；实在找不到再回头收它。
 			logMoovCheck(logger, path, cid, fileOff, 0, 0, "no_checks")
-			return cid, true
+			if firstNoChecks == 0 {
+				firstNoChecks = cid // 记下第一个无考点的候选，作为备选
+			}
+			continue
 		case passed == checked:
 			logMoovCheck(logger, path, cid, fileOff, checked, passed, "pass")
 			return cid, true
 		default:
 			logMoovCheck(logger, path, cid, fileOff, checked, passed, "reject")
 		}
+	}
+	// 窗口内没找到有考点且通过的：如果之前遇到过无考点的候选，收它（标记低置信度）。
+	if firstNoChecks != 0 {
+		logger.Debug("moov map: accepting no-checks candidate as fallback",
+			slog.String("entry", path), slog.Uint64("cid", uint64(firstNoChecks)))
+		return firstNoChecks, true
 	}
 	return 0, false
 }
@@ -502,13 +517,16 @@ func pickTail(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32
 //
 // 剩下的（扫过但什么都不像）就是要的 —— mdat / data 块正是这个样子。
 //
-// 只给这类格式开，别扩散：JPEG / PNG 有强判据，认不出来就是真不是，兜底只会接错。
+// 只给这类格式开，别扩散：JPEG 有强判据（FF 00 填充），认不出来就是真不是；
+// PNG 中间簇落在 IDAT zlib 流里，孤立看一簇确实不可判定，但多簇 PNG 断链后
+// 需要兜底拼接，verify 的真解码会兜住错拼。
 func pickLoose(stats *ScanStats, state map[uint32]ClusterState, claims map[uint32]string,
 	used map[uint32]bool, last uint32, want feature.Kind,
 	logger *slog.Logger, path string) (uint32, bool) {
 	if want != feature.KindMP4Payload &&
 		want != feature.KindMOVPayload &&
-		want != feature.KindWAVPayload {
+		want != feature.KindWAVPayload &&
+		want != feature.KindPNGPayload {
 		return 0, false
 	}
 

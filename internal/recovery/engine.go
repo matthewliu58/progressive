@@ -151,6 +151,16 @@ func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger,
 	}
 	lastCid := firstCid + totalCid // 合法簇号区间是 [firstCid, lastCid)
 
+	// chainSeenHint 是下面 markChain 里 seen 表的初始容量。
+	//
+	// seen 只用来挡 FAT 成环，绝大多数链实际只有几簇到几十簇。给它一个小容量、
+	// 让 Go 自己按需增长（插入是摊销 O(1)）最合适。
+	//
+	// 要紧的是别拿「单条链最多走多少簇」（chainLimit）当容量 hint —— 那个上限在
+	// 长度未知时是整卡簇数，1TB 卡约 3200 万，照它预分配等于每个条目开工前先
+	// 吃掉几百 MB，而这样的链往往第一轮迭代就走到 EOC 退出了，纯浪费。
+	const chainSeenHint = 64
+
 	// 单条链最多走多少簇，防止 FAT 成环时无限循环。
 	chainLimit := func(dataLength uint64) uint64 {
 		if clusterSize == 0 || dataLength == 0 {
@@ -170,7 +180,8 @@ func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger,
 	markChain := func(e fsinit.FileEntryItem) {
 		cid := e.FirstCluster
 		limit := chainLimit(e.DataLength)
-		seen := make(map[uint32]struct{}, limit)
+		// 只用来挡 FAT 成环，按实际走到的簇数增长即可（见 chainSeenHint）。
+		seen := make(map[uint32]struct{}, chainSeenHint)
 
 		for i := range limit {
 			if cid < firstCid || cid >= lastCid {

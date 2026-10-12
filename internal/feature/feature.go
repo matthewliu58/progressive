@@ -153,6 +153,30 @@ func (k Kind) FragmentKind() Kind {
 	}
 }
 
+// SameFamily 判断两种分类是不是同一个容器家族。
+//
+// 为什么要它：MP4 和 MOV 是同一套 ISO 基媒体文件格式，盒子结构和 moov 地图完全
+// 通用，唯一差别是 ftyp 品牌 —— 而品牌归族并不牢靠，实际文件里家族跟扩展名也常常
+// 对不上（把 MP4 品牌的文件存成 .mov 很常见）。所以「第一簇是不是某个文件的头」
+// 这类判定不能按 Kind 精确相等来卡：判成 MOV 或 MP4 都说明这一簇是完好的 ISO 容器
+// 头，区别只该体现在日志分类上。
+//
+// 其余格式之间没有家族关系，退回精确相等。
+func SameFamily(got, want Kind) bool {
+	iso := func(k Kind) bool {
+		switch k {
+		case KindMP4Header, KindMP4Payload,
+			KindMOVHeader, KindMOVPayload:
+			return true
+		}
+		return false
+	}
+	if iso(got) && iso(want) {
+		return true
+	}
+	return got == want
+}
+
 // IsJPEG 返回这一簇是不是 JPEG 候选（头或后续碎片都算）。
 func (h Hit) IsJPEG() bool {
 	return h.Kind == KindJPEGHeader ||
