@@ -1,6 +1,7 @@
 package recovery
 
 import (
+	"bytes"
 	"log/slog"
 
 	"progrescarve/internal/feature/mov"
@@ -22,6 +23,10 @@ import (
 // moovTailProbe 是往回探多少簇。moov 大的时候会跨好几簇（几百 KB 到几 MB 都有），
 // 但它总是贴着文件尾，所以从最后一簇往回看几簇就够。
 const moovTailProbe = 4
+
+// boxHeaderSize 是盒子头的长度字段占几字节：盒子是 [长度(4)][类型(4)]，
+// 所以搜到 "moov" 这四个字节后，盒子头从它前面 boxHeaderSize 字节开始。
+const boxHeaderSize = 4
 
 // moovProbe 是一次探测的结论。
 type moovProbe struct {
@@ -80,10 +85,9 @@ func probeMoov(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem) moovP
 
 	// 二、文件尾：按 DataLength 推出最后一簇，从它往回看几簇。
 	//
-	// TODO: 手机视频的 moov 起点通常不簇对齐（ftyp+mdat 长度随机），
-	// 导致簇首是 mdat 尾数据，scanBoxes 从簇首 0 偏移解析必然失败。
-	// 当前实现依赖相机视频的 moov 簇对齐特性，对手机视频会静默退化到启发式。
-	// 修法：改为 bytes.Index(data, []byte("moov")) 全文搜索，再用 MoovSize 校验。
+	// 手机视频的 moov 起点通常不簇对齐（ftyp+mdat 长度随机），簇首还在 mdat 的数据
+	// 里，只从偏移 0 按 box 解析会漏掉 —— 曾经因此对手机视频静默退化到启发式。
+	// 现在每簇先从偏移 0 解析一遍，失败再在簇内全文搜 "moov" 标记、从盒子头重解析。
 	fileClusters := (entry.DataLength + clusterSize - 1) / clusterSize
 	if fileClusters == 0 {
 		return p
@@ -107,19 +111,43 @@ func probeMoov(parser fsinit.FileSystemParser, entry fsinit.FileEntryItem) moovP
 			continue
 		}
 		p.ClustersProbed++
+
+		// 先按老办法：从簇首按 box 结构解析。moov 正好簇对齐时（相机视频）走这条。
 		if f := mp4.Scan(data); mp4.HasIndex(f) {
-			p.TailHasMOOV = true
-			p.MOOVCluster, p.MOOVOffset = cid, f.MOOVOffset
-			if p.Codec == "" {
-				p.Codec = mp4.CodecTag(data)
-			}
-			if p.Codec == "" {
-				p.Codec = mov.CodecTag(data)
-			}
+			p.setTail(cid, f.MOOVOffset, data)
 			break
+		}
+
+		// 手机视频的 moov 起点通常不簇对齐（ftyp+mdat 长度随机），这一簇开头还在
+		// mdat 的数据里，从偏移 0 解析必然失败。
+		//
+		// 退一步在簇内搜 "moov" 标记，再从盒子头重新解析一遍：只有真能解析出索引
+		// 才算数 —— "moov" 四个字节随机撞上的概率约 6e-5 每簇，而且撞上也过不了
+		// 下面 box 结构这一关，不会引入误报。
+		if k := bytes.Index(data, []byte("moov")); k >= boxHeaderSize {
+			start := k - boxHeaderSize
+			if f := mp4.Scan(data[start:]); mp4.HasIndex(f) {
+				p.setTail(cid, int(start), data[start:])
+				break
+			}
 		}
 	}
 	return p
+}
+
+// setTail 记下 moov 落在哪一簇、簇内第几字节，并补认编码（mp4 认不出的 Apple
+// 编码交给 mov 包补，见 probeMoov 头部的说明）。
+//
+// data 必须和 offset 同源：从 moov 盒子头开始，后面 CodecTag 才探得对。
+func (p *moovProbe) setTail(cid uint32, offset int, data []byte) {
+	p.TailHasMOOV = true
+	p.MOOVCluster, p.MOOVOffset = cid, offset
+	if p.Codec == "" {
+		p.Codec = mp4.CodecTag(data)
+	}
+	if p.Codec == "" {
+		p.Codec = mov.CodecTag(data)
+	}
 }
 
 // logMoovProbe 记一条探测结果。

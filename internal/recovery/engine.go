@@ -745,6 +745,28 @@ type RestoreSummary struct {
 // stats 是空闲簇扫描的索引，往后传给 RestoreFile：链断在 DataLength 之前的文件靠它续接。
 // 传 nil 就只写元数据能确认的那前半段。
 func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterState, owners ClusterOwner, stats *ScanStats, outRoot string, pre string, logger *slog.Logger) (RestoreSummary, error) {
+	// TODO(孤儿文件落地)：恢复完全由目录项驱动，扫描（Scan）找到的「孤儿文件头」
+	// 从来没被用来创建新文件 —— stats.Hits 目前只做三件事：打日志、给 carve 当
+	// 候选窗口（fragments）、校验第一簇（HitAt）。于是「目录项已被覆盖、但文件头
+	// 还在空闲簇里」的那些文件，扫到了也白白浪费（实测一轮能扫到 mp4_header 和
+	// mov_header 各 1 个）。
+	//
+	// 要补就在本函数末尾加一步「孤儿恢复」：
+	//   1. 遍历 stats.Hits 里的 header 类（JPEG/MP4/MOV/PNG/WAV header）；
+	//      注意 payload 类（jpeg_payload 等）不能当文件起点，只有 header 能起；
+	//   2. 用全局 claims 跳过已被真实条目认领的簇（这个表现在就有）；
+	//   3. 造合成条目：Path 用假名（如 _carved/orphan_<首簇>.<ext>）、
+	//      FirstCluster 就是那一簇、DataLength 未知；
+	//   4. 走现有 RestoreFile + verify，建议 verify 不过就不落盘 ——
+	//      否则长度定不了的格式会往输出目录灌一堆打不开的垃圾。
+	//
+	// 最大的坎是长度，按格式分两种：
+	//   - JPEG / PNG：有结束标记（EOI / IEND），IsFileEnd() 已支持，carveFollow
+	//     会自动停（见 carve.go 里 IsFileEnd 那处）→ 干净，建议先做这两个；
+	//   - MP4 / MOV / WAV：没有结束标记（WAV 的 IsWAVEnd 恒 false），没有
+	//     DataLength 就不知道该读多长，只能一路拼到 pickNext 失败或
+	//     carveMaxClusters(4096)。MP4/MOV 可以先试 moov：探到就能算出真实大小
+	//     （见 moov.go 的 probeMoov），探不到再考虑给上限并标记「长度是猜的」。
 	entries, err := parser.ListAllFileEntries()
 	if err != nil {
 		return RestoreSummary{}, fmt.Errorf("list file entries: %w", err)
@@ -1013,6 +1035,7 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 			slog.Any("err", err), slog.String("path", path))
 		return err
 	}
+
 	// DetectFileSystem 认不出来时返回的是 (nil, nil) 而不是错误，不挡住的话下一步会空指针 panic。
 	if parser == nil {
 		err := fmt.Errorf("unsupported file system on %s", path)

@@ -30,6 +30,17 @@ const (
 
 	// maxDirDepth 防止损坏卷上的目录互相指向导致无限递归
 	maxDirDepth = 64
+
+	// maxDirClusters 是读一个目录内容时最多顺着簇链读多少簇，长度已知未知都受它管。
+	//
+	// 为什么必须设上限：首簇一旦被别的文件重新占用（已删除目录极常见），
+	// fat[首簇] 就指进了那个文件的簇链，顺着读下去等于把整条链读完 —— 往卡里拷
+	// 几个大视频就有几千簇，1TB 卷上最坏能读到上 TB，Load 直接卡死。
+	// 只挡「长度未知（DataLength==0）」不够：已删除目录的 DataLength 常常残留成
+	// 一个巨大的垃圾值，那条路同样绕不过去。所以最后统一压到这个数。
+	//
+	// 正常目录哪怕上万条条目（32MB ≈ 128 簇）也远到不了，超了说明长度或链是失控的。
+	maxDirClusters = 1024
 )
 
 // BootInfo 是引导扇区里解析出来的卷参数。
@@ -205,6 +216,8 @@ func (p *ExFatParser) Load(f *os.File) error {
 	}
 
 	bitmapCluster, bitmapLen, rootEntries := parseDirectoryEntries(rootData)
+	slog.Info("recovery dbg: root dir parsed", "root_bytes", len(rootData),
+		"entries", len(rootEntries), "bitmap_cluster", bitmapCluster, "bitmap_len", bitmapLen)
 
 	// 收下根目录下的条目，并对标记为目录的条目递归展开
 	files := make([]FileInfo, 0, len(rootEntries))
@@ -218,10 +231,17 @@ func (p *ExFatParser) Load(f *os.File) error {
 			continue
 		}
 		visitedDirs[ent.FirstCluster] = true
+		// 卡住时最后一条 walk dir begin 就是元凶：看它的 data_length 是不是失控
+		// （已删除目录的流扩展项丢了会读到 0，或残留成一个巨大值），
+		// 以及 first_cluster 是不是已经被别的文件重新占用。
+		slog.Info("recovery dbg: walk dir begin", "path", ent.Path,
+			"first_cluster", ent.FirstCluster, "data_length", ent.DataLength,
+			"no_fat_chain", ent.NoFatChain, "deleted", ent.IsDeleted)
 		if err := walkDirectory(f, &boot, fatTable, clusterSize, ent, 1, visitedDirs, &files); err != nil {
 			// 单个子目录读失败不该让整个卷加载失败
 			p.warn("exfat: walk sub directory failed", ent.Path, err)
 		}
+		slog.Info("recovery dbg: walk dir end", "path", ent.Path, "files", len(files))
 	}
 
 	bitmapBytes, err := readAllocationBitmap(f, &boot, bitmapCluster, bitmapLen, clusterSize)
@@ -578,12 +598,19 @@ func readDirData(f *os.File, boot *BootInfo, fat []uint32, clusterSize uint64,
 		return nil, nil
 	}
 
-	// 该目录最多有多少个簇：长度已知就按长度算，否则以 FAT 表长为上限
+	// 该目录最多有多少个簇：长度已知就按长度算，但无论哪种最后都压到 maxDirClusters。
+	//
+	// 不能拿 FAT 表长（约 390 万）当上限：首簇若已被别的文件重新占用，fat[首簇]
+	// 会指进那个文件的簇链，整条链被顺着读完（往卡里拷几个大视频就有几千簇），
+	// Load 直接卡死。DataLength 本身也可能是残留的巨大垃圾值，所以光按长度算挡不住。
 	maxClusters := uint64(len(fat))
 	if dataLength > 0 {
 		if n := (dataLength + clusterSize - 1) / clusterSize; n > 0 && n < maxClusters {
 			maxClusters = n
 		}
+	}
+	if maxClusters > maxDirClusters {
+		maxClusters = maxDirClusters
 	}
 	if maxClusters == 0 {
 		maxClusters = 1

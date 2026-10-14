@@ -63,6 +63,46 @@ func inspectCluster(logger *slog.Logger, pre, path string, cid uint32, data []by
 			slog.Int("jpeg_eoi", j.EOIOffset))
 	}
 
+	// MOV 复用 mp4.Feature，判据字段跟 MP4 一模一样，只是族不同；
+	// 单独摊开，不然 MOV 簇被误判时看不到证据（FTYP/MOOV/MDAT 偏移、NAL 节奏）。
+	if m := h.MOV; m != nil {
+		attrs = append(attrs,
+			slog.Int("mov_nal_frames", m.NALFrames),
+			slog.Int("mov_nal_run", m.NALRunMax),
+			slog.Float64("mov_nal_density", m.NALDensity),
+			slog.Int("mov_ftyp", m.FTYPOffset),
+			slog.Int("mov_moov", m.MOOVOffset),
+			slog.Int("mov_mdat", m.MDATOffset),
+			slog.Int("mov_len_size", m.LengthSize),
+			slog.Bool("mov_hevc", m.HEVC))
+	}
+
+	// PNG：靠「从某起点按 chunk 结构能连续走通多少字节」认，关键 chunk 是 IHDR/IDAT/IEND。
+	if p := h.PNG; p != nil {
+		attrs = append(attrs,
+			slog.Bool("png_sig", p.HasSignature),
+			slog.Int("png_walk", p.ChunkWalkEnd),
+			slog.Int("png_chunks", p.ChunkCount),
+			slog.Bool("png_ihdr", p.HasIHDR),
+			slog.Bool("png_idat", p.HasIDAT),
+			slog.Bool("png_iend", p.HasIEND),
+			slog.Int("png_tail", int(p.TailState)),
+			slog.Int("png_head", int(p.HeadState)))
+	}
+
+	// WAV：同样靠 RIFF chunk 走通长度认，关键 chunk 是 fmt / data / LIST。
+	if w := h.WAV; w != nil {
+		attrs = append(attrs,
+			slog.Bool("wav_wave", w.HasWave),
+			slog.Int("wav_walk", w.ChunkWalkEnd),
+			slog.Int("wav_chunks", w.ChunkCount),
+			slog.Bool("wav_fmt", w.HasFmt),
+			slog.Bool("wav_data", w.HasData),
+			slog.Bool("wav_list", w.HasLIST),
+			slog.Int("wav_tail", int(w.TailState)),
+			slog.Int("wav_head", int(w.HeadState)))
+	}
+
 	logger.Debug("cluster inspect", attrs...)
 }
 

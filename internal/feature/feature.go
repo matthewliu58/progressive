@@ -1,6 +1,8 @@
 package feature
 
 import (
+	"bytes"
+
 	"progrescarve/internal/feature/jpeg"
 	"progrescarve/internal/feature/mov"
 	"progrescarve/internal/feature/mp4"
@@ -354,15 +356,21 @@ func Classify(cluster uint32, data []byte) Hit {
 	// （见 mov 包说明），只把 Kind 分开：没有 ftyp（从 moov 起）或品牌是 qt  一族
 	// 归 MOV，其余（isom/mp42/M4V 等品牌）归 MP4。
 	if mov.IsMOVHeader(data) {
-		f := mp4.Scan(data)
+		setISOHeader(&h, data, mp4.Scan(data))
 
-		if !mp4.IsMP4Header(data) || mov.Brand(data) == "mov" {
-			h.Kind = KindMOVHeader
-			h.MOV = &f
-		} else {
-			h.Kind = KindMP4Header
-			h.MP4 = &f
-		}
+		return h
+	}
+
+	// ftyp 不在簇首、落在簇中间的情况（这一簇前半截是上一个文件的尾巴，MP4 从
+	// 中间某个位置开始）：上面只看偏移 0，这种够不着，整簇会被判成 None 漏掉。
+	// 这里退一步在整簇里找 ftyp 盒子，找到就从那个位置起按头算。
+	//
+	// 敢在整簇里搜，是因为 ftyp 是 4 字节、随机撞上的概率约 6e-5 每簇，而且命中后
+	// 还要再过一遍 mov.IsMOVHeader 的盒子长度校验，误报再降一档。
+	// 反过来 "moov" 不能这么搜：moov 常常出现在文件末尾，整簇一搜会把一堆中间簇
+	// 误判成 MOV 头。
+	if off, ok := findFTYPBox(data); ok {
+		setISOHeader(&h, data[off:], mp4.Scan(data[off:]))
 
 		return h
 	}
@@ -461,4 +469,45 @@ func Classify(cluster uint32, data []byte) Hit {
 	// ------------------------------------------------------------------
 
 	return h
+}
+
+// setISOHeader 按 ISO 盒子的品牌把 h 定成 MOV 头或 MP4 头。
+//
+// data 必须从盒子头开始 —— 可能是整簇，也可能是 findFTYPBox 找到位置后切出来的
+// 子切片；f 是同一个起点扫出来的特征。两者起点必须一致，否则 box 偏移对不上。
+func setISOHeader(h *Hit, data []byte, f mp4.Feature) {
+	if !mp4.IsMP4Header(data) || mov.Brand(data) == "mov" {
+		h.Kind = KindMOVHeader
+		h.MOV = &f
+	} else {
+		h.Kind = KindMP4Header
+		h.MP4 = &f
+	}
+}
+
+// findFTYPBox 在整簇里找 ftyp 盒子头的偏移，找不到返回 false。
+//
+// 只认 ftyp（文件类型盒，标志文件起点）。moov 不搜 —— 它常出现在文件末尾，
+// 整簇搜会把一堆中间簇误判成文件头（见 Classify 里的说明）。
+func findFTYPBox(data []byte) (int, bool) {
+	tag := []byte("ftyp")
+	idx := 0
+
+	for {
+		k := bytes.Index(data[idx:], tag)
+		if k < 0 {
+			return 0, false
+		}
+
+		pos := idx + k
+		idx = pos + 1
+
+		// 盒子头是 [长度(4)][类型(4)]：类型前面得有 4 字节长度，才谈得上盒子头。
+		if pos < 4 {
+			continue
+		}
+		if mov.IsMOVHeader(data[pos-4:]) {
+			return pos - 4, true
+		}
+	}
 }
