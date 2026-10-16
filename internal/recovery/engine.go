@@ -744,7 +744,7 @@ type RestoreSummary struct {
 // 失败才算错误；一个都没恢复出来是正常结果，由返回的汇总说明。
 // stats 是空闲簇扫描的索引，往后传给 RestoreFile：链断在 DataLength 之前的文件靠它续接。
 // 传 nil 就只写元数据能确认的那前半段。
-func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterState, owners ClusterOwner, stats *ScanStats, outRoot string, pre string, logger *slog.Logger) (RestoreSummary, error) {
+func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterState, owners ClusterOwner, stats *ScanStats, claims map[uint32]string, outRoot string, pre string, logger *slog.Logger) (RestoreSummary, error) {
 	// TODO(孤儿文件落地)：恢复完全由目录项驱动，扫描（Scan）找到的「孤儿文件头」
 	// 从来没被用来创建新文件 —— stats.Hits 目前只做三件事：打日志、给 carve 当
 	// 候选窗口（fragments）、校验第一簇（HitAt）。于是「目录项已被覆盖、但文件头
@@ -793,9 +793,10 @@ func RestoreAllDeleted(parser fsinit.FileSystemParser, state map[uint32]ClusterS
 		slog.Int("system_junk", junk),
 		slog.Int("candidates", deleted-deletedDirs-junk))
 
-	// 认领表：簇号 → 谁先用了它。chain 里的簇和猜出来的簇都要登记，否则两个残缺
-	// 文件会把同一簇各自写进自己的输出，两份都是错的。
-	claims := make(map[uint32]string)
+	// claims 由调用方建好传进来，跟孤儿恢复（RestoreOrphans）共用同一张表：
+	// 条目先跑先认领，孤儿只在没被认领的簇上下手，两边不会抢同一簇。
+	// 表本身的作用：簇号 → 谁先用了它。chain 里的簇和猜出来的簇都要登记，否则
+	// 两个残缺文件会把同一簇各自写进自己的输出，两份都是错的。
 
 	var sum RestoreSummary
 	var lastErr error
@@ -1075,8 +1076,12 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 			slog.Int("read_failed", stats.ReadFailed),
 		}, hitAttrs(stats.Hits)...)...)
 
+	// 认领表：簇号 → 谁先用了它。条目恢复和孤儿恢复共用一张，保证先跑的条目优先，
+	// 孤儿只在没人认领的簇上下手（见 RestoreOrphans 的说明）。
+	claims := make(map[uint32]string)
+
 	// 把所有可恢复的已删除文件捞出来，按原路径落到 outRoot 下。
-	sum, err := RestoreAllDeleted(parser, state, owners, &stats, outRoot, pre, logger)
+	sum, err := RestoreAllDeleted(parser, state, owners, &stats, claims, outRoot, pre, logger)
 	if err != nil {
 		logger.Error("restore deleted files err", slog.String("pre", pre),
 			slog.Any("err", err), slog.String("path", path), slog.String("out_root", outRoot))
@@ -1097,6 +1102,17 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 		slog.Int("mp4_with_moov", sum.MP4WithMoov),
 		slog.String("out_root", outRoot))
 
-	logger.Info("recovery end", slog.String("pre", pre), slog.String("path", path))
+	// 目录项丢了、但扫描还认得出文件头的那些文件，按假名落进 _orphans（见 orphan.go）。
+	// 必须排在条目恢复之后：共用 claims，条目先认领过的簇孤儿不能抢。
+	// 默认关（EnableOrphans），产出是假名文件，打开后要单独核对。
+	var orphanOK, orphanBad int
+	if EnableOrphans {
+		orphanOK, orphanBad = RestoreOrphans(parser, state, owners, &stats, claims,
+			outRoot, pre, logger)
+	}
+
+	logger.Info("recovery end", slog.String("pre", pre), slog.String("path", path),
+		slog.Bool("orphans_enabled", EnableOrphans),
+		slog.Int("orphans", orphanOK), slog.Int("orphans_failed", orphanBad))
 	return nil
 }
