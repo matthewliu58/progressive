@@ -96,9 +96,9 @@ func hitAttrs(hits map[feature.Kind][]uint32) []any {
 	return attrs
 }
 
-// scanLimit 是扫描上限（按派发出去读的空闲簇数计）：整卡空闲簇上百万，全扫一遍
-// 要很久；先扫这么多个空闲簇看分类结果，验证够了再放开（math.MaxInt）。
-const scanLimit = 100_000
+// scanLimitBytes 是扫描上限（按字节计）：整卡空闲簇上百万，全扫一遍
+// 要很久；按固定字节量算簇数，自动适配簇大小（32K/64K/128K）。
+const scanLimitBytes = 128 << 30 // 128GB
 
 // scanProgressEvery 是进度日志的间隔，按已扫空闲簇数计。
 const scanProgressEvery = 10_000
@@ -122,8 +122,16 @@ const scanWorkers = 8
 // 只统计、不写盘。单簇读失败只跳过不报错；每 scanProgressEvery 个簇报一次进度。
 func Scan(parser fsinit.FileSystemParser, state map[uint32]ClusterState, pre string,
 	logger *slog.Logger) ScanStats {
-	_, firstCid, totalCid := parser.ClusterHeapRange()
+	clusterSize, firstCid, totalCid := parser.ClusterHeapRange()
 	lastCid := firstCid + totalCid
+
+	// 按 128GB 上限动态算簇数，自动适配簇大小（32K/64K/128K）。
+	var scanLimit int
+	if clusterSize > 0 {
+		scanLimit = scanLimitBytes / int(clusterSize)
+	} else {
+		scanLimit = scanLimitBytes / (32 << 10) // 兜底：假设 32K 簇
+	}
 
 	var (
 		mu  sync.Mutex // 守 sum：Hits/Index 是 map，多 worker 并发写会炸
