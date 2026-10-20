@@ -96,9 +96,17 @@ func hitAttrs(hits map[feature.Kind][]uint32) []any {
 	return attrs
 }
 
-// scanLimitBytes 是扫描上限（按字节计）：整卡空闲簇上百万，全扫一遍
+// scanLimitBytes 是期望的扫描上限（按字节计）：整卡空闲簇上百万，全扫一遍
 // 要很久；按固定字节量算簇数，自动适配簇大小（32K/64K/128K）。
-const scanLimitBytes = 128 << 30 // 128GB
+//
+// 想扫少点就调小它 —— 删除文件通常集中在低簇位，你这批都在 300~8300 簇，
+// 扫 8GB（32768 簇）就完全覆盖，时间能砍到几分之一。
+const scanLimitBytes = 8 << 30 // 8GB（默认；可按需调大）
+
+// maxScanBytes 是不管 scanLimitBytes 设多大、扫描量都绝不超过的天花板。
+// 实测 64GB 已远超绝大多数删除文件的覆盖需求，再大只是白白吃 I/O 和时间。
+// 所以：目标比 64GB 小就按目标扫（比如 8G 就 8G），目标比 64GB 大也只扫到 64G。
+const maxScanBytes = 64 << 30 // 64GB 硬上限
 
 // scanProgressEvery 是进度日志的间隔，按已扫空闲簇数计。
 const scanProgressEvery = 10_000
@@ -125,12 +133,18 @@ func Scan(parser fsinit.FileSystemParser, state map[uint32]ClusterState, pre str
 	clusterSize, firstCid, totalCid := parser.ClusterHeapRange()
 	lastCid := firstCid + totalCid
 
-	// 按 128GB 上限动态算簇数，自动适配簇大小（32K/64K/128K）。
+	// 期望扫描量以 scanLimitBytes 为准，但封顶 maxScanBytes：设得再大也只扫到 64GB。
+	limit := scanLimitBytes
+	if limit > maxScanBytes {
+		limit = maxScanBytes
+	}
+
+	// 按上限动态算簇数，自动适配簇大小（32K/64K/128K）。
 	var scanLimit int
 	if clusterSize > 0 {
-		scanLimit = scanLimitBytes / int(clusterSize)
+		scanLimit = limit / int(clusterSize)
 	} else {
-		scanLimit = scanLimitBytes / (32 << 10) // 兜底：假设 32K 簇
+		scanLimit = limit / (32 << 10) // 兜底：假设 32K 簇
 	}
 
 	var (
