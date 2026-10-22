@@ -1,0 +1,5 @@
+{
+  "source": "/dev/rdisk5s1",
+  "card_root": "/Volumes/test1",
+  "scan_limit_gb": 64
+}

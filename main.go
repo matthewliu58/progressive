@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -60,6 +61,51 @@ func isMountPoint(p string) bool {
 	return ok1 && ok2 && sd.Dev != pd.Dev
 }
 
+// appConfig 是命令行之外可配置的项：待恢复源、恢复输出挂载点、扫描上限。
+type appConfig struct {
+	// Source 是待恢复的源：裸设备（如 /dev/rdisk5s1）或 dd 出来的镜像文件。
+	Source string `json:"source"`
+	// CardRoot 是恢复输出所在挂载点：必须真是挂载点（见 isMountPoint）。
+	// 数据收进它下面的自建子目录 recovered，避免 O_TRUNC 误截断卡上原有文件。
+	CardRoot string `json:"card_root"`
+	// ScanLimitGB 是期望扫描量（GB）。内部封顶 64GB —— 设得再大也只扫到 64G。
+	// 删除文件通常集中在低簇位，你这批都在 300~8300 簇，8 就足够覆盖。
+	ScanLimitGB int `json:"scan_limit_gb"`
+}
+
+// defaultConfig 是找不到配置文件时的兜底值。
+var defaultConfig = appConfig{
+	Source:      "/dev/rdisk5s1",
+	CardRoot:    "/Volumes/test1",
+	ScanLimitGB: 8,
+}
+
+// loadConfig 读 config.json。文件不存在或解析失败都返回默认（不致命），
+// 调用方会记日志，仍能用旧行为跑起来。
+//
+// JSON 里只写了部分字段时，缺的字段补回默认 —— 否则空字符串 / 0 会悄无声息地
+// 把源 / 输出指向错误位置（比如 CardRoot 为空时 isMountPoint 直接拦掉，但报错信息看不出根因）。
+func loadConfig(path string) (appConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return defaultConfig, err
+	}
+	var cfg appConfig
+	if err := json.Unmarshal(data, &cfg); err != nil {
+		return defaultConfig, err
+	}
+	if cfg.Source == "" {
+		cfg.Source = defaultConfig.Source
+	}
+	if cfg.CardRoot == "" {
+		cfg.CardRoot = defaultConfig.CardRoot
+	}
+	if cfg.ScanLimitGB <= 0 {
+		cfg.ScanLimitGB = defaultConfig.ScanLimitGB
+	}
+	return cfg, nil
+}
+
 func main() {
 
 	fmt.Println("=== MAIN START1 ===")
@@ -93,12 +139,28 @@ func main() {
 
 	logger.Info("finit log success", slog.String("pre", pre))
 
-	// 源卡用裸设备读。目标卡不行：/dev/rdisk4s1 是设备节点不是目录，只能走挂载点。
-	path := "/dev/rdisk5s1" // 旧卡 KOCARDGO（1TB）：待恢复的源
+	// 源卡、输出挂载点、扫描上限都从 config.json 读进来，不写死在代码里。
+	cfg, err := loadConfig("config.json")
+	if err != nil {
+		// 没配置文件不致命：退回默认（见 defaultConfig），但记一笔，免得事后不知道
+		// 实际用的是哪个源 / 哪个输出 / 扫多少。
+		logger.Warn("config file not loaded, using defaults",
+			slog.String("pre", pre), slog.String("path", "config.json"), slog.Any("err", err))
+	} else {
+		logger.Info("config loaded", slog.String("pre", pre),
+			slog.String("source", cfg.Source), slog.String("card_root", cfg.CardRoot),
+			slog.Int("scan_limit_gb", cfg.ScanLimitGB))
+	}
+
+	// 源卡用裸设备读，或 dd 出来的镜像文件。输出挂载点不行：设备节点不是目录。
+	path := cfg.Source
 
 	// 恢复数据收进自建子目录：写文件用 O_TRUNC，跟卡上原有文件重名会静默截断重写。
 	// 隔一层之后这个风险只落在我们自己产出的东西上，卡上原有数据一个都不会被碰。
-	cardRoot := "/Volumes/test1"
+	cardRoot := cfg.CardRoot
+
+	// 扫描上限由 GB 换算成字节，传给 Engine；Scan 内部会再封顶到 64GB。
+	scanLimitBytes := int64(cfg.ScanLimitGB) << 30
 	outRoot := filepath.Join(cardRoot, "recovered")
 
 	// 卡没挂上必须拦住：MkdirAll 会欣然在内置盘上建出 /Volumes/test1，
@@ -119,7 +181,7 @@ func main() {
 
 	// Engine 的返回值不能丢：识别不出文件系统、设备打不开这些失败只在日志里有，
 	// 返回值一丢进程照样往下走，最后退出码还是 0，脚本和 CI 都看不出失败过。
-	if err := recovery.Engine(path, outRoot, pre, logger); err != nil {
+	if err := recovery.Engine(path, outRoot, scanLimitBytes, pre, logger); err != nil {
 		logger.Error("recovery engine failed", slog.String("pre", pre), slog.Any("err", err))
 		os.Exit(1)
 	}

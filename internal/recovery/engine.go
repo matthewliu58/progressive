@@ -156,19 +156,34 @@ func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger,
 	// seen 只用来挡 FAT 成环，绝大多数链实际只有几簇到几十簇。给它一个小容量、
 	// 让 Go 自己按需增长（插入是摊销 O(1)）最合适。
 	//
-	// 要紧的是别拿「单条链最多走多少簇」（chainLimit）当容量 hint —— 那个上限在
-	// 长度未知时是整卡簇数，1TB 卡约 3200 万，照它预分配等于每个条目开工前先
-	// 吃掉几百 MB，而这样的链往往第一轮迭代就走到 EOC 退出了，纯浪费。
+	// 要紧的是别拿「单条链最多走多少簇」（chainLimit）当容量 hint —— 那个上限过去
+	// 在长度未知时是整卡簇数（1TB 卡约 3200 万），照它预分配等于每个条目开工前
+	// 先吃掉几百 MB，而这样的链往往第一轮迭代就走到 EOC 退出了，纯浪费。
 	const chainSeenHint = 64
 
-	// 单条链最多走多少簇，防止 FAT 成环时无限循环。
+	// unknownChainClusters 是「长度不可信」（读到 0 或垃圾值）时，单条链最多认多少簇。
+	//
+	// 绝不能用整卡簇数兜底 —— 那等于默许一个坏条目把整个簇堆全标成「已占用」。
+	// 实测就炸过：某条目 DataLength 不可信，markChain 顺着 NoFatChain 的 cid++
+	// 一路标到底，used 从正常的 8 千暴涨到 379 万，free 只剩 11 万：
+	//   10-14 14:04：used=8001    free=3898977   ← 正常
+	//   10-14 14:44：used=3793684 free=113295    ← 崩了，此后一直没恢复
+	// 后果有两个：扫描只能在头 11 万簇里打转（scan_limit_gb 配多大都到不了 64GB），
+	// 落在这之外的已删文件还全被误判成「已被覆盖」。
+	//
+	// 取 1024 跟目录侧的 maxDirClusters 一致：目录本来就读不了那么长，
+	// 真文件又有准确的 DataLength，走不到这里。
+	const unknownChainClusters = 1024
+
+	// 单条链最多走多少簇：既防 FAT 成环无限循环，也防坏长度吃掉整个簇堆。
 	chainLimit := func(dataLength uint64) uint64 {
 		if clusterSize == 0 || dataLength == 0 {
-			return uint64(totalCid)
+			return unknownChainClusters
 		}
 		n := (dataLength + clusterSize - 1) / clusterSize
 		if n == 0 || n > uint64(totalCid) {
-			return uint64(totalCid)
+			// n 比整卡还大 = DataLength 读到垃圾值，跟「未知」一个待遇。
+			return unknownChainClusters
 		}
 		return n
 	}
@@ -1019,7 +1034,8 @@ func outputPath(outRoot, name string) (string, error) {
 }
 
 // Engine 打开 path 指向的设备，识别文件系统，把上面的已删除文件恢复到 outRoot 下。
-func Engine(path string, outRoot string, pre string, logger *slog.Logger) error {
+// scanLimitBytes 是期望扫描量（按字节计），封顶 64GB，由 main 从配置读入后传入。
+func Engine(path string, outRoot string, scanLimitBytes int64, pre string, logger *slog.Logger) error {
 	slog.Info("recovery start", slog.String("pre", pre), slog.String("path", path))
 
 	f, err := os.Open(path)
@@ -1067,7 +1083,7 @@ func Engine(path string, outRoot string, pre string, logger *slog.Logger) error 
 	// 先把空闲簇扫一遍，再恢复：断链文件（FAT 被删文件时清空，只剩第一簇）要靠
 	// 扫描出来的内容特征索引去续后半段。代价是文件落地要等这一遍扫描（1TB 得一阵子），
 	// 换的是那些「只有第一簇」的照片能救回整张。
-	stats := Scan(parser, state, pre, logger)
+	stats := Scan(parser, state, scanLimitBytes, pre, logger)
 	logger.Info("scan free clusters done",
 		append([]any{
 			slog.String("pre", pre),

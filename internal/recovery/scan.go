@@ -96,16 +96,10 @@ func hitAttrs(hits map[feature.Kind][]uint32) []any {
 	return attrs
 }
 
-// scanLimitBytes 是期望的扫描上限（按字节计）：整卡空闲簇上百万，全扫一遍
-// 要很久；按固定字节量算簇数，自动适配簇大小（32K/64K/128K）。
-//
-// 想扫少点就调小它 —— 删除文件通常集中在低簇位，你这批都在 300~8300 簇，
-// 扫 8GB（32768 簇）就完全覆盖，时间能砍到几分之一。
-const scanLimitBytes = 8 << 30 // 8GB（默认；可按需调大）
-
-// maxScanBytes 是不管 scanLimitBytes 设多大、扫描量都绝不超过的天花板。
-// 实测 64GB 已远超绝大多数删除文件的覆盖需求，再大只是白白吃 I/O 和时间。
-// 所以：目标比 64GB 小就按目标扫（比如 8G 就 8G），目标比 64GB 大也只扫到 64G。
+// maxScanBytes 是扫描量绝不超过的天花板（见 Scan 的 scanLimitBytes 参数）：
+// 不管配置里 scan_limit_gb 设多大，扫描量都封顶到 64GB。实测 64GB 已远超绝大多数
+// 删除文件的覆盖需求，再大只是白白吃 I/O 和时间。所以目标比 64GB 小就按目标扫
+// （比如 8G 就 8G），目标比 64GB 大也只扫到 64G。
 const maxScanBytes = 64 << 30 // 64GB 硬上限
 
 // scanProgressEvery 是进度日志的间隔，按已扫空闲簇数计。
@@ -118,7 +112,11 @@ const scanProgressEvery = 10_000
 const scanWorkers = 8
 
 // Scan 把「没有活文件占着」的簇读出来，按 feature.Classify 分类计数，
-// 派满 scanLimit 个簇为止。
+// 派满 scanLimitBytes 个簇为止。
+//
+// scanLimitBytes 是期望扫描量（按字节计），内部会封顶到 maxScanBytes（64GB）。
+// 整卡空闲簇上百万，全扫一遍要很久；按固定字节量算簇数，自动适配簇大小
+// （32K/64K/128K）。这个值由 main 从 config.json 的 scan_limit_gb 读入后换算传入。
 //
 // 扫哪些簇：ClusterFree（位图未占用）和 ClusterUnknown（位图说占了，但没有活文件
 // 认领）都要扫。后者是实测逼出来的 —— 删文件时 FAT 清了、位图却未必跟着清，
@@ -128,8 +126,8 @@ const scanWorkers = 8
 // ClusterUsed 不扫：那是活文件正在用的数据，拿来拼被删文件只会拼错。
 //
 // 只统计、不写盘。单簇读失败只跳过不报错；每 scanProgressEvery 个簇报一次进度。
-func Scan(parser fsinit.FileSystemParser, state map[uint32]ClusterState, pre string,
-	logger *slog.Logger) ScanStats {
+func Scan(parser fsinit.FileSystemParser, state map[uint32]ClusterState,
+	scanLimitBytes int64, pre string, logger *slog.Logger) ScanStats {
 	clusterSize, firstCid, totalCid := parser.ClusterHeapRange()
 	lastCid := firstCid + totalCid
 
@@ -142,9 +140,9 @@ func Scan(parser fsinit.FileSystemParser, state map[uint32]ClusterState, pre str
 	// 按上限动态算簇数，自动适配簇大小（32K/64K/128K）。
 	var scanLimit int
 	if clusterSize > 0 {
-		scanLimit = limit / int(clusterSize)
+		scanLimit = int(limit / int64(clusterSize))
 	} else {
-		scanLimit = limit / (32 << 10) // 兜底：假设 32K 簇
+		scanLimit = int(limit / int64(32<<10)) // 兜底：假设 32K 簇
 	}
 
 	var (
