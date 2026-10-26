@@ -68,7 +68,7 @@ type appConfig struct {
 	// CardRoot 是恢复输出所在挂载点：必须真是挂载点（见 isMountPoint）。
 	// 数据收进它下面的自建子目录 recovered，避免 O_TRUNC 误截断卡上原有文件。
 	CardRoot string `json:"card_root"`
-	// ScanLimitGB 是期望扫描量（GB）。内部封顶 64GB —— 设得再大也只扫到 64G。
+	// ScanLimitGB 是期望扫描量（GB）。内部封顶 1TB —— 设得再大也只扫到 1T。
 	// 删除文件通常集中在低簇位，你这批都在 300~8300 簇，8 就足够覆盖。
 	ScanLimitGB int `json:"scan_limit_gb"`
 }
@@ -159,7 +159,7 @@ func main() {
 	// 隔一层之后这个风险只落在我们自己产出的东西上，卡上原有数据一个都不会被碰。
 	cardRoot := cfg.CardRoot
 
-	// 扫描上限由 GB 换算成字节，传给 Engine；Scan 内部会再封顶到 64GB。
+	// 扫描上限由 GB 换算成字节，传给 Engine；Scan 内部会再封顶到 1TB。
 	scanLimitBytes := int64(cfg.ScanLimitGB) << 30
 	outRoot := filepath.Join(cardRoot, "recovered")
 

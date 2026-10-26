@@ -168,7 +168,7 @@ func BuildClusterState(parser fsinit.FileSystemParser, logger *slog.Logger,
 	// 一路标到底，used 从正常的 8 千暴涨到 379 万，free 只剩 11 万：
 	//   10-14 14:04：used=8001    free=3898977   ← 正常
 	//   10-14 14:44：used=3793684 free=113295    ← 崩了，此后一直没恢复
-	// 后果有两个：扫描只能在头 11 万簇里打转（scan_limit_gb 配多大都到不了 64GB），
+	// 后果有两个：扫描只能在头 11 万簇里打转（scan_limit_gb 配多大都到不了 1TB），
 	// 落在这之外的已删文件还全被误判成「已被覆盖」。
 	//
 	// 取 1024 跟目录侧的 maxDirClusters 一致：目录本来就读不了那么长，
@@ -1034,7 +1034,7 @@ func outputPath(outRoot, name string) (string, error) {
 }
 
 // Engine 打开 path 指向的设备，识别文件系统，把上面的已删除文件恢复到 outRoot 下。
-// scanLimitBytes 是期望扫描量（按字节计），封顶 64GB，由 main 从配置读入后传入。
+// scanLimitBytes 是期望扫描量（按字节计），封顶 1TB，由 main 从配置读入后传入。
 func Engine(path string, outRoot string, scanLimitBytes int64, pre string, logger *slog.Logger) error {
 	slog.Info("recovery start", slog.String("pre", pre), slog.String("path", path))
 
